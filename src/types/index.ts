@@ -3,6 +3,7 @@ export interface ImageEntry {
   src: string;
   w: number;
   h: number;
+  masks: Mask[];
 }
 
 export interface BulkProgress {
