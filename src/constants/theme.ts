@@ -15,6 +15,4 @@ export const C = {
   text: "#dce4f0",
   muted: "#4a5570",
   subtle: "#1e2035",
-};
-
-export const PALETTE = ["#ffffff", "#000000", "#e8b86d", "#ff4d4d", "#4d94ff", "#3ecf8e"];
+} as const;

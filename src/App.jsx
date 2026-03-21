@@ -1,5 +1,5 @@
-import WatermarkStudio from './WatermarkStudio'
+import ObscuraX from './ObscuraX'
 
 export default function App() {
-  return <WatermarkStudio />
+  return <ObscuraX />
 }
