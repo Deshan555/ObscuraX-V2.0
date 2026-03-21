@@ -280,11 +280,13 @@ export default function WatermarkStudio() {
       try {
         const MODEL_URL = "https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights";
         await Promise.all([
+          faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
           faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
         ]);
+        console.log("WatermarkStudio: Models loaded successfully");
         setModelsLoaded(true);
       } catch (err) {
-        console.error("Failed to load face-api models:", err);
+        console.error("WatermarkStudio: Failed to load models:", err);
       }
     }
     loadModels();
@@ -311,19 +313,25 @@ export default function WatermarkStudio() {
     }
 
     if (!input || !inputW || !inputH) return;
-
-    const detections = await faceapi.detectAllFaces(input, new faceapi.TinyFaceDetectorOptions());
-    if (detections.length > 0) {
-      const newMasks: Mask[] = detections.map(d => ({
-        id: Math.random().toString(36).substr(2, 9),
-        x: d.box.x / inputW,
-        y: d.box.y / inputH,
-        w: d.box.width / inputW,
-        h: d.box.height / inputH,
-        type: maskType,
-        isAuto: true
-      }));
-      setMasks(prev => [...prev, ...newMasks]);
+    console.log("WatermarkStudio: Starting auto-detection...");
+    try {
+      // Use SsdMobilenetv1 for better accuracy on group photos
+      const detections = await faceapi.detectAllFaces(input, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.4 }));
+      console.log(`WatermarkStudio: Detected ${detections.length} faces`);
+      if (detections.length > 0) {
+        const newMasks: Mask[] = detections.map(d => ({
+          id: Math.random().toString(36).substr(2, 9),
+          x: d.box.x / inputW,
+          y: d.box.y / inputH,
+          w: d.box.width / inputW,
+          h: d.box.height / inputH,
+          type: maskType,
+          isAuto: true
+        }));
+        setMasks(prev => [...prev, ...newMasks]);
+      }
+    } catch (err) {
+      console.error("WatermarkStudio: Detection error:", err);
     }
   }, [modelsLoaded, mode, images, selectedIdx, maskType]);
 
