@@ -38,9 +38,11 @@ export default function ObscuraX() {
   const [wmShadow, setWmShadow] = useState(true);
   const [wmPos, setWmPos] = useState({ x: 0.5, y: 0.93 });
   const [wmFilter, setWmFilter] = useState("none");
+  const [wmBlur, setWmBlur] = useState(4);
   const [exportPrefix, setExportPrefix] = useState("watermarked_");
 
   const [masks, setMasks] = useState<Mask[]>([]);
+  const [maskBlur, setMaskBlur] = useState(12);
   const [maskingMode, setMaskingMode] = useState(false);
   const [activePreset, setActivePreset] = useState<string | null>("bc");
   const [selMaskIdx, setSelMaskIdx] = useState<number | null>(null);
@@ -115,7 +117,8 @@ export default function ObscuraX() {
     wmOpacity, wmBold, wmShadow, wmPos,
     wmImgEl: wmImgEl.current,
     wmFilter,
-  }), [wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, wmFilter]);
+    wmBlur,
+  }), [wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, wmFilter, wmBlur]);
 
   const draw = useCallback(() => {
     const cvs = canvasRef.current;
@@ -126,7 +129,9 @@ export default function ObscuraX() {
     if (!ctx) return;
     ctx.clearRect(0, 0, cvs.width, cvs.height);
     const cfg = wmConfig();
-    ctx.filter = cfg.wmFilter || "none";
+    let filter = cfg.wmFilter || "none";
+    if (filter === "blur") filter = `blur(${cfg.wmBlur}px)`;
+    ctx.filter = filter;
     ctx.drawImage(med, 0, 0, cvs.width, cvs.height);
     ctx.filter = "none";
     applyMasks(ctx, cvs.width, cvs.height, masks);
@@ -179,6 +184,7 @@ export default function ObscuraX() {
           x: d.box.x / inputW, y: d.box.y / inputH,
           w: d.box.width / inputW, h: d.box.height / inputH,
           type: maskType, isAuto: true,
+          blurLevel: maskType === "blur" ? maskBlur : undefined,
         }));
         if (mode === "image") {
           setImages(prev => prev.map((img, i) => {
@@ -299,7 +305,7 @@ export default function ObscuraX() {
     const pos = posFromEvent(e);
     if (maskingMode) {
       maskStart.current = pos;
-      const newMask = { id: Date.now().toString(), ...pos, w: 0, h: 0, type: maskType, isAuto: false };
+      const newMask: Mask = { id: Date.now().toString(), ...pos, w: 0, h: 0, type: maskType, isAuto: false, blurLevel: maskType === "blur" ? maskBlur : undefined };
       if (mode === "image") {
         setImages(prev => prev.map((img, i) => i === selectedIdx ? { ...img, masks: [...img.masks, newMask] } : img));
       } else {
@@ -365,7 +371,7 @@ export default function ObscuraX() {
   };
 
   const exportConfigJson = () => {
-    const cfg = { wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, wmFilter, exportPrefix };
+    const cfg = { wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, wmFilter, wmBlur, exportPrefix };
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([JSON.stringify(cfg, null, 2)], { type: "application/json" }));
     a.download = "obscurax_settings.json"; a.click();
@@ -387,6 +393,7 @@ export default function ObscuraX() {
         if (cfg.wmShadow !== undefined) setWmShadow(cfg.wmShadow);
         if (cfg.wmPos) setWmPos(cfg.wmPos);
         if (cfg.wmFilter) setWmFilter(cfg.wmFilter);
+        if (cfg.wmBlur) setWmBlur(cfg.wmBlur);
         if (cfg.exportPrefix) setExportPrefix(cfg.exportPrefix);
       } catch (_) { setFileError("Invalid configuration file."); }
     };
@@ -416,7 +423,9 @@ export default function ObscuraX() {
       const imgEl = await new Promise<HTMLImageElement>(resolve => { const el = new Image(); el.onload = () => resolve(el); el.src = entry.src; });
       const offscr = document.createElement("canvas"); offscr.width = imgEl.naturalWidth; offscr.height = imgEl.naturalHeight;
       const ctx = offscr.getContext("2d"); if (!ctx) continue;
-      ctx.filter = cfg.wmFilter || "none"; ctx.drawImage(imgEl, 0, 0); ctx.filter = "none";
+      let filter = cfg.wmFilter || "none";
+      if (filter === "blur") filter = `blur(${cfg.wmBlur}px)`;
+      ctx.filter = filter; ctx.drawImage(imgEl, 0, 0); ctx.filter = "none";
       applyMasks(ctx, offscr.width, offscr.height, entry.masks || []); applyWatermark(ctx, offscr.width, offscr.height, cfg);
       const blob = await new Promise<Blob | null>(res => offscr.toBlob(res, entry.file.type === "image/png" ? "image/png" : "image/jpeg", 0.96));
       if (blob) { const buf = await blob.arrayBuffer(); const ext = entry.file.type === "image/png" ? "png" : "jpg"; folder!.file(`${exportPrefix}${entry.file.name.replace(/\.[^.]+$/, "")}.${ext}`, buf); }
@@ -594,6 +603,16 @@ export default function ObscuraX() {
                 </div>
               </div>
             )}
+            {maskingMode && maskType === "blur" && (
+              <Slider label="Blur Intensity" value={maskBlur} min={2} max={80} onChange={val => {
+                setMaskBlur(val);
+                if (mode === "image") {
+                  setImages(prev => prev.map((img, i) => i === selectedIdx ? { ...img, masks: img.masks.map(m => m.type === "blur" ? { ...m, blurLevel: val } : m) } : img));
+                } else {
+                  setMasks(prev => prev.map(m => m.type === "blur" ? { ...m, blurLevel: val } : m));
+                }
+              }} />
+            )}
             {masks.length > 0 && (
               <button onClick={() => {
                 if (mode === "image") {
@@ -613,6 +632,11 @@ export default function ObscuraX() {
             <select value={wmFilter} onChange={e => setWmFilter(e.target.value)} style={{ width: "100%", background: C.card, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: "8px 28px 8px 10px", fontFamily: "'JetBrains Mono',monospace", fontSize: 11, outline: "none", cursor: "pointer", WebkitAppearance: "none", appearance: "none" }}>
               {FILTERS.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
             </select>
+            {wmFilter === "blur" && (
+              <div style={{ marginTop: 12 }}>
+                <Slider label="Blur Radius" value={wmBlur} min={0} max={25} fmt={v => `${v}px`} onChange={setWmBlur} />
+              </div>
+            )}
           </div>
 
           <div>

@@ -46,7 +46,7 @@ export function applyMasks(ctx: CanvasRenderingContext2D, W: number, H: number, 
 
     ctx.save();
     if (m.type === "blur") {
-      ctx.filter = "blur(12px)";
+      ctx.filter = `blur(${m.blurLevel ?? 12}px)`;
       ctx.drawImage(ctx.canvas, x, y, w, h, x, y, w, h);
     } else if (m.type === "pixelate") {
       const pSize = 24;

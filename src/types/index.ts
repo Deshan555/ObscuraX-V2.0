@@ -24,6 +24,7 @@ export interface WatermarkConfig {
   wmPos: { x: number; y: number };
   wmImgEl: HTMLImageElement | null;
   wmFilter: string;
+  wmBlur: number;
 }
 
 export type MaskType = "blur" | "box" | "pixelate";
@@ -36,4 +37,5 @@ export interface Mask {
   h: number;
   type: MaskType;
   isAuto?: boolean;
+  blurLevel?: number;
 }
