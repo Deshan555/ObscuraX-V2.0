@@ -1,39 +1,41 @@
-import React, { FC } from "react";
-import { C } from "../../constants/theme";
+import React, { FC, useEffect, useId, useState } from "react";
 
-export const Sect: FC<{ children: React.ReactNode }> = ({ children }) => (
-  <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, letterSpacing: 2.5, textTransform: "uppercase", color: C.muted, marginBottom: 10, paddingBottom: 7, borderBottom: `1px solid ${C.border}` }}>
+// Shared controls. Styling lives in src/index.css; these only set classes and ARIA.
+
+export const Field: FC<{ label: string; children: React.ReactNode; htmlFor?: string }> = ({ label, children, htmlFor }) => (
+  <div className="field">
+    {htmlFor ? <label className="lbl" htmlFor={htmlFor}>{label}</label> : <div className="lbl">{label}</div>}
     {children}
   </div>
 );
 
-export const FL: FC<{ children: React.ReactNode }> = ({ children }) => (
-  <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: C.muted, letterSpacing: 1.5, textTransform: "uppercase", marginBottom: 6 }}>
-    {children}
+export const TextInput: FC<{ value: string; onChange: (v: string) => void; placeholder?: string; id?: string; label?: string }> = ({ value, onChange, placeholder, id, label }) => (
+  <input id={id} className="input" value={value} placeholder={placeholder} aria-label={id ? undefined : label} onChange={e => onChange(e.target.value)} />
+);
+
+export const Select: FC<{ value: string; onChange: (v: string) => void; options: { value: string; label: string }[]; id?: string; label?: string }> = ({ value, onChange, options, id, label }) => (
+  <div className="select">
+    <select id={id} className="input" value={value} aria-label={id ? undefined : label} onChange={e => onChange(e.target.value)}>
+      {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+    </select>
   </div>
 );
 
-export const TI: FC<{ value: string; onChange: (v: string) => void; placeholder?: string }> = ({ value, onChange, placeholder }) => (
-  <input
-    value={value}
-    onChange={e => onChange(e.target.value)}
-    placeholder={placeholder}
-    style={{ width: "100%", boxSizing: "border-box", background: C.card, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: "9px 12px", fontFamily: "'JetBrains Mono',monospace", fontSize: 11, outline: "none", display: "block" }}
-    onFocus={e => (e.target.style.borderColor = C.goldDim)}
-    onBlur={e => (e.target.style.borderColor = C.border)}
-  />
-);
-
-export const Toggle: FC<{ label: string; value: boolean; onChange: (v: boolean) => void }> = ({ label, value, onChange }) => (
-  <label style={{ display: "flex", alignItems: "center", gap: 9, cursor: "pointer", userSelect: "none" }}>
-    <div onClick={() => onChange(!value)} style={{ width: 34, height: 18, borderRadius: 9, position: "relative", background: value ? C.gold : C.subtle, transition: "background .18s", flexShrink: 0 }}>
-      <div style={{ position: "absolute", top: 3, left: value ? 17 : 3, width: 12, height: 12, borderRadius: "50%", background: value ? C.bg : C.muted, transition: "left .18s" }} />
+/** A settings row: text on the left, switch on the right. */
+export const SwitchRow: FC<{ label: string; sub?: string; value: boolean; onChange: (v: boolean) => void; disabled?: boolean }> = ({ label, sub, value, onChange, disabled }) => {
+  const id = useId();
+  return (
+    <div className="set-row">
+      <div className="set-text">
+        <div id={id}>{label}</div>
+        {sub && <div className="sub">{sub}</div>}
+      </div>
+      <button type="button" role="switch" className="switch" aria-checked={value} aria-labelledby={id} disabled={disabled} onClick={() => onChange(!value)} />
     </div>
-    <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 10, color: C.muted }}>{label}</span>
-  </label>
-);
+  );
+};
 
-interface SliderProps {
+interface RangeProps {
   label: string;
   value: number;
   min: number;
@@ -41,80 +43,65 @@ interface SliderProps {
   step?: number;
   onChange: (v: number) => void;
   fmt?: (v: number) => string;
-  accent?: string;
 }
 
-export const Slider: FC<SliderProps> = ({ label, value, min, max, step = 1, onChange, fmt, accent = C.gold }) => {
-  const pct = ((value - min) / (max - min)) * 100;
+export const Range: FC<RangeProps> = ({ label, value, min, max, step = 1, onChange, fmt }) => {
+  const id = useId();
   return (
-    <div style={{ marginBottom: 14 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
-        <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: C.muted, letterSpacing: 1.5, textTransform: "uppercase" }}>{label}</span>
-        <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 11, color: accent }}>{fmt ? fmt(value) : value}</span>
+    <div className="range">
+      <div className="range-head">
+        <label htmlFor={id}>{label}</label>
+        <output htmlFor={id}>{fmt ? fmt(value) : value}</output>
       </div>
-      <input
-        type="range" min={min} max={max} step={step} value={value}
-        onChange={e => onChange(Number(e.target.value))}
-        style={{ width: "100%", cursor: "pointer", height: 3, borderRadius: 2, outline: "none", border: "none", WebkitAppearance: "none", appearance: "none", background: `linear-gradient(to right,${accent} ${pct}%,${C.subtle} ${pct}%)` }}
-      />
+      <input id={id} type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(Number(e.target.value))} />
     </div>
   );
 };
-
-interface BtnProps {
-  children: React.ReactNode;
-  onClick?: () => void;
-  disabled?: boolean;
-  color?: string;
-  mb?: number;
-}
-
-export const Btn: FC<BtnProps> = ({ children, onClick, disabled = false, color = C.gold, mb = 8 }) => (
-  <button
-    onClick={onClick}
-    disabled={disabled}
-    style={{
-      width: "100%", marginBottom: mb, padding: "11px", fontFamily: "'JetBrains Mono',monospace", fontSize: 10,
-      fontWeight: 700, letterSpacing: 2, borderRadius: 8, display: "block",
-      cursor: disabled ? "not-allowed" : "pointer", transition: "all .15s",
-      background: disabled ? C.card : color === C.gold ? C.gold : `${color}25`,
-      border: `1px solid ${disabled ? C.border : color}`,
-      color: disabled ? C.muted : color === C.gold ? C.bg : color,
-    }}
-  >
-    {children}
-  </button>
-);
-
-export const WmTab: FC<{ id: string; label: string; active: boolean; onSelect: (id: string) => void }> = ({ id, label, active, onSelect }) => (
-  <button
-    onClick={() => onSelect(id)}
-    style={{ flex: 1, padding: "8px 0", background: active ? C.gold : "transparent", border: `1px solid ${active ? C.gold : C.border}`, borderRadius: 7, color: active ? C.bg : C.muted, fontFamily: "'JetBrains Mono',monospace", fontSize: 10, letterSpacing: 1.5, cursor: "pointer", fontWeight: active ? 700 : 500, transition: "all .14s" }}
-  >
-    {label}
-  </button>
-);
 
 interface SegProps<T extends string> {
   options: { value: T; label: string }[];
   value: T;
   onChange: (v: T) => void;
-  accent?: string;
-  mb?: number;
+  label: string;
 }
 
-/** Row of mutually exclusive buttons. */
-export function Seg<T extends string>({ options, value, onChange, accent = C.gold, mb = 12 }: SegProps<T>) {
+/** Segmented control: a pill track with one chosen option. */
+export function Seg<T extends string>({ options, value, onChange, label }: SegProps<T>) {
   return (
-    <div style={{ display: "flex", gap: 5, marginBottom: mb }}>
-      {options.map(o => {
-        const on = o.value === value;
-        return (
-          <button key={o.value} onClick={() => onChange(o.value)} style={{ flex: 1, padding: "6px 0", background: on ? accent : C.card, border: `1px solid ${on ? accent : C.border}`, borderRadius: 5, color: on ? C.bg : C.muted, fontFamily: "'JetBrains Mono',monospace", fontSize: 9, letterSpacing: 1, cursor: "pointer", fontWeight: on ? 700 : 400 }}>
-            {o.label}
-          </button>
-        );
-      })}
+    <div className="seg" role="group" aria-label={label}>
+      {options.map(o => (
+        <button key={o.value} type="button" aria-pressed={o.value === value} onClick={() => onChange(o.value)}>{o.label}</button>
+      ))}
     </div>
   );
 }
+
+/**
+ * Destructive button that confirms in place: the first click arms it
+ * ("Confirm?"), a second click within 3 seconds runs the action.
+ */
+export const ArmedBtn: FC<{ children: React.ReactNode; onConfirm: () => void; className?: string; disabled?: boolean }> = ({ children, onConfirm, className = "", disabled }) => {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(false), 3000);
+    return () => clearTimeout(t);
+  }, [armed]);
+  return (
+    <button type="button" className={`btn danger ${armed ? "armed" : ""} ${className}`} disabled={disabled}
+      onClick={() => { if (armed) { setArmed(false); onConfirm(); } else setArmed(true); }}>
+      {armed ? "Confirm?" : children}
+    </button>
+  );
+};
+
+export const Spinner: FC = () => <span className="spin" aria-hidden="true" />;
+
+export const Progress: FC<{ label: string; meta?: string; pct: number }> = ({ label, meta, pct }) => (
+  <div className="pg">
+    <div className="pg-line"><span>{label}</span>{meta && <span className="pg-meta">{meta}</span>}</div>
+    <div className="bar" role="progressbar" aria-label={label} aria-valuenow={Math.round(pct)} aria-valuemin={0} aria-valuemax={100}>
+      <i style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} />
+    </div>
+  </div>
+);

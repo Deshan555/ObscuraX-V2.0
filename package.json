@@ -10,9 +10,11 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource/poppins": "^5.3.0",
     "@types/jszip": "^3.4.0",
     "face-api.js": "^0.22.2",
     "jszip": "^3.10.1",
+    "lucide-react": "^1.79.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },

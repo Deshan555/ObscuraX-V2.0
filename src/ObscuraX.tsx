@@ -2,12 +2,16 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import JSZip from "jszip/dist/jszip.min.js";
 
 import { ImageEntry, BulkProgress, WatermarkConfig, Mask, MaskStyle, DetectSettings, TrackSample } from "./types";
-import { C } from "./constants/theme";
 import { WM, PRESETS, FONTS, PALETTE, MAX_FILES, FILTERS, DEFAULT_MASK_STYLE, DEFAULT_DETECT_SETTINGS } from "./constants/config";
 import { applyWatermark, applyMasks } from "./utils/canvas";
 import { loadFaceModels, detectFaces, facesToMasks, boxesAt, seekVideo } from "./utils/faceDetection";
 import { detectImageResolution } from "./helpers/media";
-import { Sect, FL, TI, Toggle, Slider, Btn, WmTab, Seg } from "./components/common/Atoms";
+import { Field, TextInput, Select, SwitchRow, Range, Seg, ArmedBtn, Spinner, Progress } from "./components/common/Atoms";
+import { useTheme } from "./hooks/useTheme";
+import {
+  ImageIcon, Type, ScanFace, Download, Upload, Sun, Moon, Monitor, Play, Pause, Volume2, VolumeX, X, Check, FileJson,
+  ArrowUpLeft, ArrowUp, ArrowUpRight, ArrowLeft, Dot, ArrowRight, ArrowDownLeft, ArrowDown, ArrowDownRight, LucideIcon,
+} from "lucide-react";
 
 const loadImage = (src: string) => new Promise<HTMLImageElement>((resolve, reject) => {
   const el = new Image();
@@ -16,9 +20,27 @@ const loadImage = (src: string) => new Promise<HTMLImageElement>((resolve, rejec
   el.src = src;
 });
 
-const MODEL_MISSING_MSG = "Face detection model isn't loaded. Wait for it, or turn off Auto-Mask Faces, before exporting.";
+const MODEL_MISSING_MSG = "The face model hasn't loaded, so faces can't be found. Wait a moment, or turn off Find faces automatically, before exporting.";
 
 type TrackStatus = "idle" | "scanning" | "ready" | "stale";
+
+type Panel = "media" | "watermark" | "masking" | "export";
+const NAV: { id: Panel; label: string; Icon: LucideIcon }[] = [
+  { id: "media", label: "Media", Icon: ImageIcon },
+  { id: "watermark", label: "Watermark", Icon: Type },
+  { id: "masking", label: "Face masking", Icon: ScanFace },
+  { id: "export", label: "Export", Icon: Download },
+];
+const PANEL_TITLES: Record<Panel, string> = { media: "Media", watermark: "Watermark", masking: "Face masking", export: "Export" };
+
+const POSITION_ICONS: Record<string, { Icon: LucideIcon; label: string }> = {
+  tl: { Icon: ArrowUpLeft, label: "Top left" }, tc: { Icon: ArrowUp, label: "Top centre" }, tr: { Icon: ArrowUpRight, label: "Top right" },
+  ml: { Icon: ArrowLeft, label: "Middle left" }, cc: { Icon: Dot, label: "Centre" }, mr: { Icon: ArrowRight, label: "Middle right" },
+  bl: { Icon: ArrowDownLeft, label: "Bottom left" }, bc: { Icon: ArrowDown, label: "Bottom centre" }, br: { Icon: ArrowDownRight, label: "Bottom right" },
+};
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const fmtTime = (t: number) => `${Math.floor(t / 60)}:${Math.floor(t % 60).toString().padStart(2, "0")}`;
 
 export default function ObscuraX() {
   const [images, setImages] = useState<ImageEntry[]>([]);
@@ -71,7 +93,13 @@ export default function ObscuraX() {
   const [exporting, setExporting] = useState(false);
   const [exportMsg, setExportMsg] = useState("");
   const [expPct, setExpPct] = useState(0);
-  const [exported, setExported] = useState(false);
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const toastTimer = useRef<number | undefined>(undefined);
+  const showToast = useCallback((msg: string) => {
+    setToastMsg(msg);
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToastMsg(null), 2600);
+  }, []);
   const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -106,13 +134,12 @@ export default function ObscuraX() {
 
   useEffect(() => {
     setImgReady(false);
-    setExported(false);
   }, [selectedIdx, images[selectedIdx]?.src, mode]);
 
   useEffect(() => {
     if (!videoFile) return;
     const url = URL.createObjectURL(videoFile);
-    setVideoSrc(url); setVideoReady(false); setExported(false);
+    setVideoSrc(url); setVideoReady(false);
     // New video: drop the previous video's masks and face track, cancel any scan.
     scanToken.current++;
     setMasks([]); setFaceTrack([]); setTrackStatus("idle"); setScan(null);
@@ -221,7 +248,7 @@ export default function ObscuraX() {
     if (!modelsLoaded) return;
     const todo = images.filter(img => !img.scanned);
     for (let i = 0; i < todo.length; i++) {
-      setScan({ label: `Detecting faces ${i + 1}/${todo.length}…`, pct: Math.round((i / todo.length) * 100) });
+      setScan({ label: `Finding faces in image ${i + 1} of ${todo.length}…`, pct: Math.round((i / todo.length) * 100) });
       try {
         const boxes = await detectFaces(await loadImage(todo[i].src), detectOpts);
         setAutoMasks(todo[i].src, facesToMasks(boxes));
@@ -258,7 +285,7 @@ export default function ObscuraX() {
         await seekVideo(vid, t);
         if (token !== scanToken.current) return false;
         samples.push({ t, boxes: await detectFaces(vid, detectOpts) });
-        setScan({ label: `Tracking faces… ${i + 1}/${n}`, pct: Math.round(((i + 1) / n) * 100) });
+        setScan({ label: `Tracking faces… ${i + 1} of ${n}`, pct: Math.round(((i + 1) / n) * 100) });
       }
     } catch (err) {
       console.error("ObscuraX: Video scan failed:", err);
@@ -322,11 +349,11 @@ export default function ObscuraX() {
     const newVideos = incoming.filter(f => f.type.startsWith("video"));
     const newImages = incoming.filter(f => f.type.startsWith("image"));
     if (newVideos.length > 0) { setVideoFile(newVideos[0]); setMode("video"); setImages([]); return; }
-    if (newImages.length === 0) { setFileError("Unsupported file type. Please upload images or a video."); return; }
+    if (newImages.length === 0) { setFileError("That file type isn't supported. Add JPG, PNG, GIF, MP4 or WebM files."); return; }
     setMode("image");
     const combined = [...images, ...newImages].slice(0, MAX_FILES);
     if (images.length + newImages.length > MAX_FILES)
-      setFileError(`Maximum ${MAX_FILES} images allowed. Extra files were ignored.`);
+      setFileError(`Only ${MAX_FILES} images fit, so the extra files were left out.`);
     const entries = await Promise.all(
       combined.map(async (item): Promise<ImageEntry> => {
         if ("src" in item) return item as ImageEntry;
@@ -415,7 +442,7 @@ export default function ObscuraX() {
         if (cfg.exportPrefix) setExportPrefix(cfg.exportPrefix);
         if (cfg.maskStyle) setMaskStyle({ ...DEFAULT_MASK_STYLE, ...cfg.maskStyle });
         if (cfg.detectSettings) updateDetectSettings(cfg.detectSettings);
-      } catch (_) { setFileError("Invalid configuration file."); }
+      } catch { setFileError("That settings file couldn't be read. Choose a file saved by ObscuraX."); }
     };
     reader.readAsText(file);
   };
@@ -429,7 +456,7 @@ export default function ObscuraX() {
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
       a.download = `${exportPrefix}${images[selectedIdx]?.file?.name ?? "image"}.${isPng ? "png" : "jpg"}`;
-      a.click(); setExported(true);
+      a.click(); showToast("Image downloaded");
     }, isPng ? "image/png" : "image/jpeg", 0.96);
   };
 
@@ -444,11 +471,11 @@ export default function ObscuraX() {
     try {
       for (let i = 0; i < images.length; i++) {
         const entry = images[i];
-        setBulkProgress({ done: i, total: images.length }); setExportMsg(`Processing ${i + 1} / ${images.length}…`);
+        setBulkProgress({ done: i, total: images.length }); setExportMsg(`Processing ${i + 1} of ${images.length}…`);
         const imgEl = await loadImage(entry.src);
         let entryMasks = entry.masks || [];
         if (autoScan && !entry.scanned) {
-          setExportMsg(`Detecting faces ${i + 1} / ${images.length}…`);
+          setExportMsg(`Finding faces ${i + 1} of ${images.length}…`);
           const autos = facesToMasks(await detectFaces(imgEl, detectOpts));
           entryMasks = [...autos, ...entryMasks.filter(m => !m.isAuto)];
           setAutoMasks(entry.src, autos);
@@ -465,14 +492,14 @@ export default function ObscuraX() {
     } catch (err) {
       // Don't ship a partial ZIP that may contain unmasked faces.
       console.error("ObscuraX: Bulk export failed:", err);
-      setFileError("Export stopped: face detection or image processing failed.");
+      setFileError("Export stopped because an image couldn't be processed. Nothing was saved. Try again, or remove that image.");
       setBulkProgress(null); setExportMsg("");
       return;
     }
     setBulkProgress({ done: images.length, total: images.length }); setExportMsg("Compressing…");
     const zipBlob = await zip.generateAsync({ type: "blob" }, (meta: { percent: number }) => setExpPct(Math.round(meta.percent)));
     const a = document.createElement("a"); a.href = URL.createObjectURL(zipBlob); a.download = `${exportPrefix}images.zip`; a.click();
-    setBulkProgress(null); setExportMsg(""); setExpPct(0); setExported(true);
+    setBulkProgress(null); setExportMsg(""); setExpPct(0); showToast("ZIP downloaded");
   };
 
   const exportVideo = async () => {
@@ -493,7 +520,7 @@ export default function ObscuraX() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a"); a.href = url; a.download = `${exportPrefix}video_${Date.now()}.webm`;
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      setExporting(false); setExpPct(0); setExported(true);
+      setExporting(false); setExpPct(0); showToast("Video downloaded");
       if (vidElRef.current) vidElRef.current.playbackRate = 1.0;
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     };
@@ -506,344 +533,399 @@ export default function ObscuraX() {
 
   const activeImg = mode === "image" && images.length > 0 ? images[selectedIdx] : null;
 
+  // ── View ────────────────────────────────────────────────────────────────────
+  const { mode: themeMode, cycle: cycleTheme } = useTheme();
+  const [panel, setPanel] = useState<Panel>("media");
+
+  // Keep --head-h current so sticky content sits below the header.
+  const headerRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => document.documentElement.style.setProperty("--head-h", `${el.offsetHeight}px`));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const ready = mode === "video" ? videoReady : imgReady;
+  const autoFaces = masks.filter(m => m.isAuto).length;
+  const drawnMasks = masks.length - autoFaces;
+  const peakFaces = faceTrack.reduce((mx, smp) => Math.max(mx, smp.boxes.length), 0);
+  const modelLoading = maskingMode && autoMaskEnabled && !modelsLoaded && !modelError;
+  const mediaName = mode === "video" ? videoFile?.name ?? "the video" : activeImg?.file.name ?? "this image";
+  const ratio = canvasDims.h ? (canvasDims.w / canvasDims.h).toFixed(2) : "";
+
+  const clearImages = () => {
+    images.forEach(img => URL.revokeObjectURL(img.src));
+    setImages([]); setMode(null); setImgReady(false);
+  };
+  const removeVideo = () => {
+    scanToken.current++;
+    setScan(null); setVideoFile(null); setVideoSrc(null); setVideoReady(false); setMode(null);
+    setMasks([]); setFaceTrack([]); setTrackStatus("idle");
+  };
+
+  // Hero: the one answer this screen gives, how many faces are covered.
+  let heroBig = "0", heroUnit: string | null = "faces", heroSub = "Add an image or a video to start.";
+  if (mode && !maskingMode) {
+    heroBig = "Off"; heroUnit = null; heroSub = "Turn on face masking to find and cover faces.";
+  } else if (mode === "image") {
+    if (autoMaskEnabled && !activeScanned) {
+      heroBig = "…"; heroUnit = null; heroSub = `Looking for faces in ${mediaName}`;
+    } else {
+      heroBig = String(autoFaces); heroUnit = autoFaces === 1 ? "face" : "faces";
+      heroSub = autoMaskEnabled ? `found in ${mediaName}` : "Finding faces is off.";
+    }
+  } else if (mode === "video") {
+    if (trackStatus === "scanning") {
+      heroBig = String(scan?.pct ?? 0); heroUnit = "%"; heroSub = "Tracking faces through the video…";
+    } else if (!autoMaskEnabled) {
+      heroBig = "0"; heroSub = "Finding faces is off.";
+    } else if (trackStatus === "ready") {
+      heroBig = String(peakFaces); heroUnit = peakFaces === 1 ? "face" : "faces";
+      heroSub = faceTrack.length ? "at most in one frame, followed through the video" : "Face track cleared.";
+    } else {
+      heroBig = "–"; heroUnit = null;
+      heroSub = trackStatus === "stale" ? "Settings changed. Rescan to update the face track." : "The video hasn't been scanned yet.";
+    }
+  }
+  if (mode && maskingMode && drawnMasks > 0) heroSub += ` · ${plural(drawnMasks, "drawn mask")}`;
+
+  let activity: string | null = null;
+  if (modelLoading) activity = "Loading face model…";
+  else if (scan) activity = scan.label;
+  else if (mode === "image" && maskingMode && autoMaskEnabled && modelsLoaded && !activeScanned) activity = "Finding faces…";
+
+  const exportAction = mode === "video"
+    ? { label: exporting ? `Recording… ${expPct}%` : "Export video", run: exportVideo, busy: exporting, disabled: !videoReady || exporting || trackStatus === "scanning" }
+    : images.length > 1
+      ? { label: bulkProgress ? exportMsg || "Exporting…" : `Export all (${images.length})`, run: exportBulkZip, busy: !!bulkProgress, disabled: !!bulkProgress || !!scan }
+      : { label: "Export image", run: exportSingleImage, busy: false, disabled: !imgReady };
+
+  const pickFiles = () => document.getElementById("__mi")?.click();
+  const renderDrop = (large: boolean) => (
+    <button type="button" className={`drop${large ? " lg" : ""}${dropActive ? " over" : ""}`} onClick={pickFiles}
+      onDragOver={e => { e.preventDefault(); setDropActive(true); }}
+      onDragLeave={() => setDropActive(false)}
+      onDrop={onMediaDrop}>
+      <Upload aria-hidden="true" />
+      <span className="t">
+        {large ? "Drop images or a video here" : images.length ? `Add more images (${images.length} of ${MAX_FILES})` : "Add images or a video"}
+      </span>
+      <span className="sub">{large ? `Or click to choose. Up to ${MAX_FILES} images, or one video.` : `JPG, PNG, GIF, MP4 or WebM · up to ${MAX_FILES} images`}</span>
+    </button>
+  );
+
+  const colourSwatches = (value: string, onChange: (c: string) => void, label: string) => (
+    <div className="swatches" role="group" aria-label={label}>
+      {PALETTE.map(clr => (
+        <button key={clr} type="button" className="swatch" style={{ background: clr }} aria-pressed={value === clr} aria-label={clr} title={clr} onClick={() => onChange(clr)} />
+      ))}
+      <input type="color" className="swatch" value={value} aria-label={`Custom ${label.toLowerCase()}`} title="Custom colour" onChange={e => onChange(e.target.value)} />
+    </div>
+  );
+
+  const ThemeIcon = themeMode === "light" ? Sun : themeMode === "dark" ? Moon : Monitor;
+  const themeLabel = themeMode === "light" ? "Light mode" : themeMode === "dark" ? "Dark mode" : "Match computer";
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh", background: C.bg, color: C.text, fontFamily: "'JetBrains Mono',monospace", overflow: "hidden" }}>
-
-      <header style={{ display: "flex", alignItems: "center", gap: 14, padding: "11px 22px", background: C.panel, borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
-        <span style={{ fontFamily: "'JetBrains Mono',monospace", fontWeight: 700, fontSize: 20, color: C.gold, letterSpacing: 1.5, whiteSpace: "nowrap" }}>ObscuraX</span>
-        <div style={{ width: 1, height: 16, background: C.border, flexShrink: 0 }} />
-        <div style={{ display: "flex", gap: 5 }}>
-          {["Face Blur", "Video", "Masking", "Filters", "ZIP Export"].map(t => (
-            <span key={t} style={{ fontSize: 8, padding: "2px 7px", borderRadius: 3, background: C.card, border: `1px solid ${C.border}`, color: C.muted, letterSpacing: 1.2, whiteSpace: "nowrap" }}>{t}</span>
+    <div className="app">
+      <aside className="nav">
+        <div className="brand">ObscuraX</div>
+        <div className="brand-sub">Blur faces, add watermarks</div>
+        <nav className="nav-list" aria-label="Sections">
+          {NAV.map(({ id, label, Icon }) => (
+            <button key={id} type="button" className="nav-item" aria-current={panel === id ? "page" : undefined} onClick={() => setPanel(id)}>
+              <Icon aria-hidden="true" />
+              <span className="nav-label">{label}</span>
+              {id === "media" && images.length > 0 && <span className="nbadge" aria-label={plural(images.length, "image")}>{images.length}</span>}
+            </button>
           ))}
+        </nav>
+        <div className="nav-end">
+          <button type="button" className="nav-item" onClick={cycleTheme} aria-label={`Colour mode: ${themeLabel}. Click to change.`} title="Change colour mode">
+            <ThemeIcon aria-hidden="true" />
+            <span className="nav-label">{themeLabel}</span>
+          </button>
         </div>
-        {images.length > 0 && (
-          <div style={{ marginLeft: "auto", flexShrink: 0 }}>
-            <span style={{ fontSize: 10, padding: "3px 10px", borderRadius: 4, background: C.goldBg, color: C.gold, border: `1px solid ${C.goldDim}` }}>{images.length} / {MAX_FILES} images</span>
+      </aside>
+
+      <main>
+        <header className="top" ref={headerRef}>
+          <h1 id="title">{PANEL_TITLES[panel]}</h1>
+          <div className="actions">
+            {activity && <span className="activity" role="status"><Spinner />{activity}</span>}
+            <button type="button" className="btn primary" onClick={exportAction.run} disabled={!mode || exportAction.disabled}>
+              {exportAction.busy ? <Spinner /> : <Download aria-hidden="true" />}
+              {mode ? exportAction.label : "Export"}
+            </button>
           </div>
-        )}
-        {mode === "video" && videoFile && (
-          <div style={{ marginLeft: images.length > 0 ? 0 : "auto", flexShrink: 0 }}>
-            <span style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: C.purpleBg, color: C.purple, border: `1px solid ${C.purple}` }}>VIDEO</span>
-          </div>
-        )}
-      </header>
+        </header>
 
-      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+        <div className="ws">
+          <div className="ws-preview">
+            <section className="card" aria-label="Preview">
+              {!mode ? renderDrop(true) : (
+                <>
+                  <div className="pv-meta">
+                    <span>{maskingMode ? "Drag on the preview to add a mask" : "Drag on the preview to move the watermark"}</span>
+                    {canvasDims.w > 0 && <span className="num">{canvasDims.w} × {canvasDims.h} px · {ratio}:1</span>}
+                  </div>
+                  <div className="pv-stage">
+                    <canvas ref={canvasRef} aria-label={`Preview of ${mediaName}`}
+                      onMouseDown={onPtrDown} onMouseMove={onPtrMove} onMouseUp={onPtrUp} onMouseLeave={onPtrUp}
+                      onTouchStart={e => { e.preventDefault(); onPtrDown(e); }}
+                      onTouchMove={e => { e.preventDefault(); onPtrMove(e); }}
+                      onTouchEnd={onPtrUp}
+                    />
+                    {!ready && <div className="pv-loading"><Spinner />Loading media…</div>}
+                  </div>
 
-        <aside style={{ width: 278, flexShrink: 0, background: C.panel, borderRight: `1px solid ${C.border}`, overflowY: "auto", padding: "18px 16px", display: "flex", flexDirection: "column", gap: 20 }}>
+                  {mode === "video" && videoReady && (
+                    <div className="pv-controls">
+                      <button type="button" className="dl-btn" onClick={() => setVideoPaused(!videoPaused)} aria-label={videoPaused ? "Play" : "Pause"} title={videoPaused ? "Play" : "Pause"}>
+                        {videoPaused ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}
+                      </button>
+                      <button type="button" className="dl-btn" onClick={() => setVideoMuted(!videoMuted)} aria-label={videoMuted ? "Turn sound on" : "Mute"} title={videoMuted ? "Turn sound on" : "Mute"}>
+                        {videoMuted ? <VolumeX aria-hidden="true" /> : <Volume2 aria-hidden="true" />}
+                      </button>
+                      <input type="range" aria-label="Position in video" min={0} max={videoDur || 100} step={0.01} value={videoTime}
+                        onChange={e => { const t = Number(e.target.value); if (vidElRef.current) vidElRef.current.currentTime = t; setVideoTime(t); }} />
+                      <span className="time">{fmtTime(videoTime)} / {fmtTime(videoDur)}</span>
+                    </div>
+                  )}
 
-          <div>
-            <Sect>Source Media</Sect>
-            <div
-              onClick={() => document.getElementById("__mi")?.click()}
-              onDragOver={e => { e.preventDefault(); setDropActive(true); }}
-              onDragLeave={() => setDropActive(false)}
-              onDrop={onMediaDrop}
-              style={{ border: `2px dashed ${dropActive ? C.gold : C.border}`, borderRadius: 10, padding: "16px 12px", textAlign: "center", cursor: "pointer", background: dropActive ? C.goldBg : C.card, transition: "all .18s" }}
-            >
-              <div style={{ fontSize: 22, marginBottom: 5 }}>📂</div>
-              <div style={{ fontSize: 11, color: C.text, marginBottom: 3 }}>{images.length > 0 ? `Add more (${images.length}/${MAX_FILES})` : "Drop files or click to upload"}</div>
-              <div style={{ fontSize: 9, color: C.muted }}>JPG · PNG · GIF · MP4 · WEBM · Max {MAX_FILES} images</div>
-            </div>
-            <input id="__mi" type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={e => e.target.files && ingestFiles(e.target.files)} />
-            {fileError && <div style={{ marginTop: 8, fontSize: 9, color: C.red, lineHeight: 1.5 }}>{fileError}</div>}
-          </div>
-
-          <div>
-            <Sect>Watermark Type</Sect>
-            <div style={{ display: "flex", gap: 5 }}>
-              <WmTab id={WM.TEXT} label="TEXT" active={wmType === WM.TEXT} onSelect={id => setWmType(id as typeof WM[keyof typeof WM])} />
-              <WmTab id={WM.IMG}  label="IMAGE" active={wmType === WM.IMG} onSelect={id => setWmType(id as typeof WM[keyof typeof WM])} />
-              <WmTab id={WM.LINK} label="LINK"  active={wmType === WM.LINK} onSelect={id => setWmType(id as typeof WM[keyof typeof WM])} />
-            </div>
-          </div>
-
-          <div>
-            <Sect>Content</Sect>
-            {wmType === WM.TEXT && <><FL>Watermark Text</FL><TI value={wmText} onChange={setWmText} placeholder="© Your Brand" /></>}
-            {wmType === WM.LINK && (<><FL>URL / Link Label</FL><TI value={wmLink} onChange={setWmLink} placeholder="https://yourbrand.com" /><div style={{ fontSize: 9, color: C.muted, marginTop: 6 }}>Rendered with underline on export</div></>)}
-            {wmType === WM.IMG && (<>
-              <FL>Logo / Watermark Image</FL>
-              <div onClick={() => document.getElementById("__wi")?.click()} style={{ border: `1px dashed ${wmImgFile ? C.goldDim : C.border}`, borderRadius: 8, padding: 14, textAlign: "center", cursor: "pointer", background: C.card }}>
-                <div style={{ fontSize: 11, color: wmImgFile ? C.gold : C.muted }}>{wmImgFile ? wmImgFile.name.slice(0, 22) : "Upload PNG logo"}</div>
-              </div>
-              <input id="__wi" type="file" accept="image/*" style={{ display: "none" }} onChange={e => e.target.files?.[0] && setWmImgFile(e.target.files[0])} />
-            </>)}
-          </div>
-
-          {(wmType === WM.TEXT || wmType === WM.LINK) && (
-            <div>
-              <Sect>Appearance</Sect>
-              <FL>Colour</FL>
-              <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-                <input type="color" value={wmColor} onChange={e => setWmColor(e.target.value)} style={{ width: 36, height: 32, border: `1px solid ${C.border}`, borderRadius: 7, cursor: "pointer", padding: 2, background: "none" }} />
-                <input value={wmColor} onChange={e => setWmColor(e.target.value)} style={{ flex: 1, background: C.card, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: "7px 10px", fontFamily: "'JetBrains Mono',monospace", fontSize: 11, outline: "none" }} />
-              </div>
-              <div style={{ display: "flex", gap: 5, marginBottom: 14 }}>
-                {PALETTE.map(clr => <div key={clr} onClick={() => setWmColor(clr)} style={{ width: 24, height: 24, borderRadius: 5, background: clr, cursor: "pointer", border: wmColor === clr ? `2px solid ${C.gold}` : `1px solid ${C.border}`, boxSizing: "border-box", flexShrink: 0 }} />)}
-              </div>
-              <FL>Font</FL>
-              <select value={wmFont} onChange={e => setWmFont(e.target.value)} style={{ width: "100%", background: C.card, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: "8px 28px 8px 10px", fontFamily: "'JetBrains Mono',monospace", fontSize: 11, outline: "none", cursor: "pointer", marginBottom: 14, WebkitAppearance: "none", appearance: "none" }}>
-                {FONTS.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
-              </select>
-              <div style={{ display: "flex", gap: 18 }}>
-                <Toggle label="Bold"   value={wmBold}   onChange={setWmBold} />
-                <Toggle label="Shadow" value={wmShadow} onChange={setWmShadow} />
-              </div>
-            </div>
-          )}
-          {wmType === WM.IMG && <div><Sect>Appearance</Sect><Toggle label="Drop Shadow" value={wmShadow} onChange={setWmShadow} /></div>}
-
-          <div>
-            <Sect>Masking</Sect>
-            <div style={{ marginBottom: 16, display: "flex", flexDirection: "column", gap: 8 }}>
-              <Toggle label="Masking Mode" value={maskingMode} onChange={setMaskingMode} />
-              {maskingMode && <Toggle label="Auto-Mask Faces" value={autoMaskEnabled} onChange={toggleAutoMask} />}
-              <div style={{ fontSize: 9, color: C.muted, fontStyle: "italic" }}>{maskingMode ? "Auto-detecting faces + drag to draw masks" : "Reposition watermark"}</div>
-              {maskingMode && autoMaskEnabled && !modelsLoaded && (
-                <div style={{ fontSize: 9, color: modelError ? C.red : C.muted, lineHeight: 1.5 }}>
-                  {modelError ? "Face model failed to load. Check your connection and reload." : "Loading face model…"}
-                </div>
+                  {mode === "image" && images.length > 0 && (
+                    <div className="gl" role="list" aria-label="Images">
+                      {images.map((img, idx) => (
+                        <div key={img.src} className="gl-item" role="listitem">
+                          <button type="button" className="gl-pick" aria-current={selectedIdx === idx} aria-label={`Show ${img.file.name}`} title={img.file.name} onClick={() => setSelectedIdx(idx)}>
+                            <img src={img.src} alt="" />
+                          </button>
+                          <button type="button" className="gl-remove" aria-label={`Remove ${img.file.name}`} title="Remove" onClick={() => removeImage(idx)}>
+                            <X aria-hidden="true" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
               )}
-            </div>
-
-            {maskingMode && autoMaskEnabled && (
-              <div style={{ marginBottom: 16 }}>
-                <FL>Face Detection</FL>
-                <Slider label="Sensitivity" value={Math.round((1 - detectSettings.minConfidence) * 100)} min={10} max={90} fmt={v => `${v}%`}
-                  onChange={v => updateDetectSettings({ minConfidence: 1 - v / 100 })} />
-                <Slider label="Face Padding" value={maskStyle.padding} min={0} max={60} fmt={v => `${v}%`}
-                  onChange={v => setMaskStyle(st => ({ ...st, padding: v }))} />
-                <Toggle label="Small-face boost (slower)" value={detectSettings.smallFaceBoost} onChange={v => updateDetectSettings({ smallFaceBoost: v })} />
-
-                {mode === "image" && images.length > 1 && (
-                  <div style={{ marginTop: 12 }}>
-                    {unscannedCount > 0 ? (
-                      <button onClick={detectAllImages} disabled={!modelsLoaded || !!scan} style={{ width: "100%", padding: "8px", background: C.goldBg, border: `1px solid ${C.goldDim}`, borderRadius: 6, color: C.gold, fontSize: 9, cursor: "pointer", fontWeight: 600, letterSpacing: 1 }}>
-                        {scan ? scan.label.toUpperCase() : `DETECT IN ALL IMAGES (${unscannedCount} LEFT)`}
-                      </button>
-                    ) : (
-                      <div style={{ fontSize: 9, color: C.teal }}>✓ All {images.length} images scanned for faces</div>
-                    )}
-                    {unscannedCount > 0 && !scan && <div style={{ fontSize: 9, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>Unscanned images are detected automatically on ZIP export.</div>}
-                  </div>
-                )}
-
-                {mode === "video" && (
-                  <div style={{ marginTop: 14 }}>
-                    <FL>Face Tracking</FL>
-                    <Slider label="Scan Rate" value={detectSettings.scanFps} min={2} max={15} fmt={v => `${v} fps`} accent={C.purple}
-                      onChange={v => updateDetectSettings({ scanFps: v })} />
-                    <div style={{ fontSize: 9, lineHeight: 1.5, marginBottom: 8, color: trackStatus === "stale" ? C.gold : trackStatus === "ready" ? C.teal : C.muted }}>
-                      {trackStatus === "idle" && "Not scanned yet. Masks will follow faces frame by frame once scanned."}
-                      {trackStatus === "scanning" && (scan?.label ?? "Tracking faces…")}
-                      {trackStatus === "stale" && "Settings changed or scan cancelled. Rescan to apply (export rescans automatically)."}
-                      {trackStatus === "ready" && (faceTrack.length === 0
-                        ? "Face track cleared."
-                        : `✓ Tracking up to ${faceTrack.reduce((mx, smp) => Math.max(mx, smp.boxes.length), 0)} face(s) across ${faceTrack.length} samples`)}
-                    </div>
-                    {trackStatus === "scanning" ? (
-                      <button onClick={cancelScan} style={{ width: "100%", padding: "8px", background: "#3d1414", border: "1px solid #632222", borderRadius: 6, color: "#ff8a8a", fontSize: 9, cursor: "pointer", fontWeight: 600, letterSpacing: 1 }}>
-                        CANCEL SCAN
-                      </button>
-                    ) : (
-                      <button onClick={scanVideo} disabled={!modelsLoaded || !videoReady || exporting} style={{ width: "100%", padding: "8px", background: C.purpleBg, border: `1px solid ${C.purple}`, borderRadius: 6, color: C.purple, fontSize: 9, cursor: "pointer", fontWeight: 600, letterSpacing: 1 }}>
-                        {trackStatus === "idle" ? "SCAN VIDEO FOR FACES" : "RESCAN VIDEO"}
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                {scan && (
-                  <div style={{ marginTop: 8, height: 3, borderRadius: 2, background: C.border }}>
-                    <div style={{ width: `${scan.pct}%`, height: "100%", background: mode === "video" ? C.purple : C.gold, borderRadius: 2, transition: "width .2s" }} />
-                  </div>
-                )}
-              </div>
-            )}
-
-            {maskingMode && (
-              <div style={{ marginBottom: 12 }}>
-                <FL>Mask Style</FL>
-                <Seg value={maskStyle.type} onChange={t => setMaskStyle(st => ({ ...st, type: t }))}
-                  options={[{ value: "blur", label: "BLUR" }, { value: "pixelate", label: "PIXEL" }, { value: "box", label: "BOX" }]} />
-                <FL>Shape</FL>
-                <Seg value={maskStyle.shape} onChange={sh => setMaskStyle(st => ({ ...st, shape: sh }))}
-                  options={[{ value: "ellipse", label: "OVAL" }, { value: "rect", label: "RECTANGLE" }]} />
-                {maskStyle.type === "box" ? (
-                  <>
-                    <FL>Box Colour</FL>
-                    <div style={{ display: "flex", gap: 5, marginBottom: 14, alignItems: "center" }}>
-                      <input type="color" value={maskStyle.color} onChange={e => setMaskStyle(st => ({ ...st, color: e.target.value }))} style={{ width: 30, height: 26, border: `1px solid ${C.border}`, borderRadius: 6, cursor: "pointer", padding: 2, background: "none" }} />
-                      {PALETTE.map(clr => <div key={clr} onClick={() => setMaskStyle(st => ({ ...st, color: clr }))} style={{ width: 22, height: 22, borderRadius: 5, background: clr, cursor: "pointer", border: maskStyle.color === clr ? `2px solid ${C.gold}` : `1px solid ${C.border}`, boxSizing: "border-box", flexShrink: 0 }} />)}
-                    </div>
-                  </>
-                ) : (
-                  <Slider label={maskStyle.type === "blur" ? "Blur Strength" : "Pixel Size"} value={maskStyle.strength} min={1} max={100} fmt={v => `${v}%`}
-                    onChange={v => setMaskStyle(st => ({ ...st, strength: v }))} />
-                )}
-                <Slider label="Edge Feather" value={maskStyle.feather} min={0} max={100} fmt={v => `${v}%`}
-                  onChange={v => setMaskStyle(st => ({ ...st, feather: v }))} />
-              </div>
-            )}
-            {(masks.length > 0 || (mode === "video" && faceTrack.length > 0)) && (
-              <button onClick={clearAllMasks} style={{ width: "100%", padding: "7px", background: "#3d1414", border: "1px solid #632222", borderRadius: 6, color: "#ff8a8a", fontSize: 8, letterSpacing: 1.5, cursor: "pointer" }}>
-                CLEAR ALL MASKS ({masks.length}{mode === "video" && faceTrack.length > 0 ? " + FACE TRACK" : ""})
-              </button>
-            )}
-            <div style={{ height: 16 }} />
-            <Sect>Size &amp; Opacity</Sect>
-            <Slider label={wmType === WM.IMG ? "Logo Width" : "Font Size"} value={wmSize} min={8} max={120} fmt={v => wmType === WM.IMG ? `${v * 5}px` : `${v}px`} onChange={setWmSize} />
-            <Slider label="Opacity" value={wmOpacity} min={5} max={100} fmt={v => `${v}%`} onChange={setWmOpacity} />
-            <FL>Global Filter</FL>
-            <select value={wmFilter} onChange={e => setWmFilter(e.target.value)} style={{ width: "100%", background: C.card, border: `1px solid ${C.border}`, borderRadius: 7, color: C.text, padding: "8px 28px 8px 10px", fontFamily: "'JetBrains Mono',monospace", fontSize: 11, outline: "none", cursor: "pointer", WebkitAppearance: "none", appearance: "none" }}>
-              {FILTERS.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
-            </select>
-            {wmFilter === "blur" && (
-              <div style={{ marginTop: 12 }}>
-                <Slider label="Blur Radius" value={wmBlur} min={0} max={25} fmt={v => `${v}px`} onChange={setWmBlur} />
-              </div>
-            )}
+            </section>
           </div>
 
-          <div>
-            <Sect>Position</Sect>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 4, marginBottom: 8 }}>
-              {PRESETS.map(p => (
-                <button key={p.id} onClick={() => { setActivePreset(p.id); setWmPos({ x: p.x, y: p.y }); }} style={{ padding: "9px 0", background: activePreset === p.id ? C.gold : C.card, border: `1px solid ${activePreset === p.id ? C.gold : C.border}`, borderRadius: 7, cursor: "pointer", color: activePreset === p.id ? C.bg : C.muted, fontSize: 16, transition: "all .12s" }}>
-                  {p.icon}
-                </button>
-              ))}
-            </div>
-            <div style={{ fontSize: 9, color: C.muted, textAlign: "center", letterSpacing: 1.5 }}>OR DRAG ON CANVAS</div>
-          </div>
+          <div className="ws-side">
+            <section className="card hero" aria-live="polite">
+              <div className="what"><span className="chip-ico"><ScanFace aria-hidden="true" /></span>Faces masked</div>
+              <div className="big">{heroBig}{heroUnit && <small>{heroUnit}</small>}</div>
+              <div className="sub">{heroSub}</div>
+            </section>
 
-          <div>
-            <Sect>Export Settings</Sect>
-            <FL>Filename Prefix</FL>
-            <TI value={exportPrefix} onChange={setExportPrefix} placeholder="e.g. obscurax_" />
-            <div style={{ height: 12 }} />
-            <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={exportConfigJson} style={{ flex: 1, padding: "7px", background: C.subtle, border: `1px solid ${C.border}`, borderRadius: 6, color: C.muted, fontSize: 8, letterSpacing: 1.5, cursor: "pointer" }}>EXPORT CONFIG</button>
-              <button onClick={() => document.getElementById("__ic")?.click()} style={{ flex: 1, padding: "7px", background: C.subtle, border: `1px solid ${C.border}`, borderRadius: 6, color: C.muted, fontSize: 8, letterSpacing: 1.5, cursor: "pointer" }}>IMPORT CONFIG</button>
-              <input id="__ic" type="file" accept=".json" style={{ display: "none" }} onChange={e => e.target.files?.[0] && importConfigJson(e.target.files[0])} />
-            </div>
-            <div style={{ height: 16 }} />
-            <Sect>Export Actions</Sect>
+            {fileError && <div className="notice err" role="alert">{fileError}</div>}
 
-            {mode === "image" && <Btn onClick={exportSingleImage} disabled={!imgReady}>↓ EXPORT CURRENT IMAGE</Btn>}
+            {panel === "media" && (
+              <section className="card">
+                <h2>Media</h2>
+                {mode ? renderDrop(false) : <p className="hint">JPG, PNG, GIF, MP4 or WebM. Up to {MAX_FILES} images, or one video. Files stay on this device.</p>}
+                {mode && canvasDims.w > 0 && (
+                  <div className="grid">
+                    <div className="stat"><div className="k">Resolution</div><div className="v">{canvasDims.w} × {canvasDims.h}</div></div>
+                    <div className="stat"><div className="k">Aspect ratio</div><div className="v">{ratio}:1</div></div>
+                    {mode === "image"
+                      ? <div className="stat"><div className="k">Images</div><div className="v">{images.length} of {MAX_FILES}</div></div>
+                      : <div className="stat"><div className="k">Length</div><div className="v">{fmtTime(videoDur)}</div></div>}
+                    <div className="stat"><div className="k">File</div><div className="v" title={mediaName}>{mediaName}</div></div>
+                  </div>
+                )}
+                {mode === "image" && <ArmedBtn className="sm" onConfirm={clearImages}>Remove all images</ArmedBtn>}
+                {mode === "video" && <ArmedBtn className="sm" onConfirm={removeVideo}>Remove video</ArmedBtn>}
+              </section>
+            )}
 
-            {mode === "image" && images.length > 1 && (
+            {panel === "watermark" && (
               <>
-                <Btn onClick={exportBulkZip} disabled={!!bulkProgress} color={C.teal}>
-                  {bulkProgress ? `⏳ ${exportMsg || `${bulkProgress.done}/${bulkProgress.total}`}` : `⬇ EXPORT ALL AS ZIP (${images.length})`}
-                </Btn>
-                {bulkProgress && <div style={{ marginTop: 8, height: 3, borderRadius: 2, background: C.border }}><div style={{ width: `${(bulkProgress.done / bulkProgress.total) * 100}%`, height: "100%", background: C.teal, borderRadius: 2, transition: "width .3s" }} /></div>}
+                <section className="card">
+                  <h2>Watermark</h2>
+                  <Seg label="Watermark type" value={wmType} onChange={setWmType}
+                    options={[{ value: WM.TEXT, label: "Text" }, { value: WM.IMG, label: "Image" }, { value: WM.LINK, label: "Link" }]} />
+                  {wmType === WM.TEXT && <Field label="Text" htmlFor="wm-text"><TextInput id="wm-text" value={wmText} onChange={setWmText} placeholder="© Your brand" /></Field>}
+                  {wmType === WM.LINK && <Field label="Link" htmlFor="wm-link"><TextInput id="wm-link" value={wmLink} onChange={setWmLink} placeholder="https://yourbrand.com" /></Field>}
+                  {wmType === WM.IMG && (
+                    <Field label="Logo">
+                      <button type="button" className="btn block" onClick={() => document.getElementById("__wi")?.click()}>
+                        <Upload aria-hidden="true" />{wmImgFile ? wmImgFile.name : "Choose a logo (PNG)"}
+                      </button>
+                    </Field>
+                  )}
+                  {wmType !== WM.IMG && (
+                    <>
+                      <Field label="Colour">{colourSwatches(wmColor, setWmColor, "Watermark colour")}</Field>
+                      <Field label="Font" htmlFor="wm-font"><Select id="wm-font" value={wmFont} onChange={setWmFont} options={FONTS} /></Field>
+                      <SwitchRow label="Bold" value={wmBold} onChange={setWmBold} />
+                    </>
+                  )}
+                  <SwitchRow label="Shadow" sub="Keeps the watermark readable on light areas." value={wmShadow} onChange={setWmShadow} />
+                </section>
+
+                <section className="card">
+                  <h2>Size and position</h2>
+                  <Range label={wmType === WM.IMG ? "Logo width" : "Text size"} value={wmSize} min={8} max={120} fmt={v => wmType === WM.IMG ? `${v * 5} px` : `${v} px`} onChange={setWmSize} />
+                  <Range label="Opacity" value={wmOpacity} min={5} max={100} fmt={v => `${v}%`} onChange={setWmOpacity} />
+                  <div className="lbl">Position</div>
+                  <div className="pos-grid" role="group" aria-label="Watermark position">
+                    {PRESETS.map(p => {
+                      const { Icon, label } = POSITION_ICONS[p.id];
+                      return (
+                        <button key={p.id} type="button" className="btn sm" aria-pressed={activePreset === p.id} aria-label={label} title={label}
+                          onClick={() => { setActivePreset(p.id); setWmPos({ x: p.x, y: p.y }); }}>
+                          <Icon aria-hidden="true" />
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="hint">Or turn off face masking and drag on the preview.</p>
+                </section>
+
+                <section className="card">
+                  <h2>Image filter</h2>
+                  <Field label="Filter" htmlFor="wm-filter"><Select id="wm-filter" value={wmFilter} onChange={setWmFilter} options={FILTERS} /></Field>
+                  {wmFilter === "blur" && <Range label="Blur radius" value={wmBlur} min={0} max={25} fmt={v => `${v} px`} onChange={setWmBlur} />}
+                </section>
               </>
             )}
 
-            {mode === "video" && (
+            {panel === "masking" && (
               <>
-                <Btn onClick={exportVideo} disabled={!videoReady || exporting || trackStatus === "scanning"}>
-                  {exporting ? `● RECORDING  ${expPct}%` : "↓ EXPORT VIDEO"}
-                </Btn>
-                {exporting && <div style={{ marginTop: 8, height: 3, borderRadius: 2, background: C.border }}><div style={{ width: `${expPct}%`, height: "100%", background: C.gold, borderRadius: 2, transition: "width .3s" }} /></div>}
-              </>
-            )}
-
-            {exported && !bulkProgress && <div style={{ marginTop: 10, textAlign: "center", fontSize: 10, color: C.teal, letterSpacing: 1 }}>✓ SAVED TO DOWNLOADS</div>}
-          </div>
-        </aside>
-
-        <main style={{ flex: 1, display: "flex", flexDirection: "column", background: C.bg, overflow: "hidden" }}>
-          <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", padding: "20px 24px 12px", overflow: "hidden", position: "relative" }}>
-            {!mode ? (
-              <div style={{ textAlign: "center", opacity: 0.28, pointerEvents: "none" }}>
-                <div style={{ fontSize: 56, marginBottom: 14 }}>🎞</div>
-                <div style={{ fontFamily: "'JetBrains Mono',monospace", fontWeight: 700, fontSize: 15, color: C.text, marginBottom: 4, letterSpacing: 1 }}>Upload media to begin</div>
-                <div style={{ fontSize: 11, color: C.muted, letterSpacing: 0.5 }}>Up to {MAX_FILES} images · or one video · Drag-and-drop or browse</div>
-              </div>
-            ) : (
-              <div style={{ width: "100%", maxWidth: 900, display: "flex", flexDirection: "column", gap: 10 }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <div style={{ fontSize: 9, color: C.muted, letterSpacing: 1.5 }}>DRAG ON CANVAS TO REPOSITION WATERMARK</div>
-                  {canvasDims.w > 0 && (
-                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                      <span style={{ fontSize: 9, color: C.muted }}>AUTO-DETECTED:</span>
-                      <span style={{ fontSize: 10, color: C.gold, fontWeight: 600 }}>{canvasDims.w} × {canvasDims.h} px</span>
-                      <span style={{ fontSize: 9, color: C.muted }}>({(canvasDims.w / canvasDims.h).toFixed(2)}:1)</span>
-                    </div>
+                <section className="card">
+                  <h2>Masks</h2>
+                  <SwitchRow label="Face masking" value={maskingMode} onChange={setMaskingMode}
+                    sub={maskingMode ? "Drag on the preview to add your own masks." : "Off: dragging on the preview moves the watermark."} />
+                  {maskingMode && (
+                    <SwitchRow label="Find faces automatically" value={autoMaskEnabled} onChange={toggleAutoMask}
+                      sub="Runs on this device. Nothing is uploaded." />
                   )}
-                </div>
-
-                <div style={{ position: "relative", borderRadius: 10, overflow: "hidden", border: `1px solid ${C.border}`, boxShadow: "0 20px 70px rgba(0,0,0,.8)", background: "#000", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  <canvas ref={canvasRef} style={{ display: "block", maxWidth: "100%", height: "auto", maxHeight: "58vh", cursor: "crosshair" }}
-                    onMouseDown={onPtrDown} onMouseMove={onPtrMove} onMouseUp={onPtrUp} onMouseLeave={onPtrUp}
-                    onTouchStart={e => { e.preventDefault(); onPtrDown(e); }}
-                    onTouchMove={e => { e.preventDefault(); onPtrMove(e); }}
-                    onTouchEnd={onPtrUp}
-                  />
-                  {(imgReady || videoReady) && (
-                    <div style={{ position: "absolute", top: 10, right: 10, fontSize: 9, letterSpacing: 1.5, color: C.gold, background: `${C.bg}dd`, padding: "3px 8px", borderRadius: 4, border: `1px solid ${C.goldDim}`, pointerEvents: "none" }}>LIVE PREVIEW</div>
+                  {maskingMode && autoMaskEnabled && modelError && (
+                    <div className="notice err" role="alert">The face model couldn't be downloaded. Check the internet connection, then reload the page.</div>
                   )}
-                  {mode && !(imgReady || videoReady) && (
-                    <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: C.card, color: C.muted, fontSize: 11, letterSpacing: 1.5 }}>LOADING MEDIA…</div>
-                  )}
-                </div>
+                </section>
 
-                {(imgReady || videoReady) && (
-                  <div style={{ display: "flex", background: C.panel, borderRadius: 8, border: `1px solid ${C.border}`, overflow: "hidden" }}>
-                    {[
-                      { label: "TYPE", value: wmType.toUpperCase() },
-                      { label: "SIZE", value: wmType === WM.IMG ? `${wmSize * 5}px` : `${wmSize}px` },
-                      { label: "OPACITY", value: `${wmOpacity}%` },
-                      { label: "X", value: `${Math.round(wmPos.x * 100)}%` },
-                      { label: "Y", value: `${Math.round(wmPos.y * 100)}%` },
-                      { label: "RESOLUTION", value: canvasDims.w > 0 ? `${canvasDims.w}×${canvasDims.h}` : "—" },
-                    ].map(({ label, value }, i, arr) => (
-                      <div key={label} style={{ flex: 1, textAlign: "center", padding: "8px 4px", borderRight: i < arr.length - 1 ? `1px solid ${C.border}` : "none" }}>
-                        <div style={{ fontSize: 8, color: C.muted, letterSpacing: 1.5, marginBottom: 3 }}>{label}</div>
-                        <div style={{ fontSize: 10, color: C.gold, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</div>
+                {maskingMode && autoMaskEnabled && (
+                  <section className="card">
+                    <h2>Detection</h2>
+                    <Range label="Sensitivity" value={Math.round((1 - detectSettings.minConfidence) * 100)} min={10} max={90} fmt={v => `${v}%`}
+                      onChange={v => updateDetectSettings({ minConfidence: 1 - v / 100 })} />
+                    <SwitchRow label="Find small faces" sub="Checks large photos in sections. Slower." value={detectSettings.smallFaceBoost}
+                      onChange={v => updateDetectSettings({ smallFaceBoost: v })} />
+                    {mode === "image" && images.length > 1 && (
+                      <div style={{ marginTop: 14 }}>
+                        {unscannedCount === 0 ? (
+                          <div className="ok-line"><Check aria-hidden="true" />All {images.length} images checked for faces</div>
+                        ) : scan ? (
+                          <Progress label={scan.label} pct={scan.pct} />
+                        ) : (
+                          <>
+                            <p className="hint">{plural(unscannedCount, "image")} not checked yet. Export checks them first.</p>
+                            <button type="button" className="btn block" onClick={detectAllImages} disabled={!modelsLoaded}>
+                              <ScanFace aria-hidden="true" />Find faces in all images
+                            </button>
+                          </>
+                        )}
                       </div>
-                    ))}
-                  </div>
+                    )}
+                  </section>
                 )}
 
-                {mode === "video" && videoReady && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 12, background: C.panel, padding: "8px 14px", borderRadius: 8, border: `1px solid ${C.border}` }}>
-                    <button onClick={() => setVideoPaused(!videoPaused)} style={{ background: "none", border: "none", color: C.gold, fontSize: 16, cursor: "pointer", width: 24 }}>{videoPaused ? "▶" : "⏸"}</button>
-                    <button onClick={() => setVideoMuted(!videoMuted)} style={{ background: "none", border: "none", color: C.gold, fontSize: 16, cursor: "pointer", width: 24, display: "flex", alignItems: "center", justifyContent: "center" }}>{videoMuted ? "🔇" : "🔊"}</button>
-                    <input type="range" min={0} max={videoDur || 100} step={0.01} value={videoTime} onChange={e => { const t = Number(e.target.value); if (vidElRef.current) vidElRef.current.currentTime = t; setVideoTime(t); }} style={{ flex: 1, cursor: "pointer", height: 3, borderRadius: 2, background: C.subtle, accentColor: C.gold }} />
-                    <div style={{ fontSize: 10, color: C.muted, whiteSpace: "nowrap" }}>{Math.floor(videoTime / 60)}:{Math.floor(videoTime % 60).toString().padStart(2, "0")} / {Math.floor(videoDur / 60)}:{Math.floor(videoDur % 60).toString().padStart(2, "0")}</div>
-                  </div>
+                {maskingMode && autoMaskEnabled && mode === "video" && (
+                  <section className="card">
+                    <h2>Face tracking</h2>
+                    <Range label="Scan rate" value={detectSettings.scanFps} min={2} max={15} fmt={v => `${v} frames/s`}
+                      onChange={v => updateDetectSettings({ scanFps: v })} />
+                    {trackStatus === "ready" && faceTrack.length > 0 ? (
+                      <div className="ok-line"><Check aria-hidden="true" />Following up to {plural(peakFaces, "face")} across {plural(faceTrack.length, "frame")}</div>
+                    ) : (
+                      <p className="hint">
+                        {trackStatus === "idle" && "Scan the video so masks follow each face from frame to frame."}
+                        {trackStatus === "scanning" && "Playback pauses while the video is scanned."}
+                        {trackStatus === "stale" && "Settings changed. Rescan to update the masks. Export rescans if needed."}
+                        {trackStatus === "ready" && "Face track cleared."}
+                      </p>
+                    )}
+                    {trackStatus === "scanning" ? (
+                      <>
+                        {scan && <Progress label={scan.label} pct={scan.pct} />}
+                        <button type="button" className="btn block" onClick={cancelScan}>Cancel scan</button>
+                      </>
+                    ) : (
+                      <button type="button" className="btn block" onClick={scanVideo} disabled={!modelsLoaded || !videoReady || exporting}>
+                        <ScanFace aria-hidden="true" />{trackStatus === "idle" ? "Scan video for faces" : "Rescan video"}
+                      </button>
+                    )}
+                  </section>
                 )}
-              </div>
+
+                {maskingMode && (
+                  <section className="card">
+                    <h2>Mask style</h2>
+                    <div className="lbl">Effect</div>
+                    <Seg label="Mask effect" value={maskStyle.type} onChange={t => setMaskStyle(st => ({ ...st, type: t }))}
+                      options={[{ value: "blur", label: "Blur" }, { value: "pixelate", label: "Pixelate" }, { value: "box", label: "Solid" }]} />
+                    <div className="lbl">Shape</div>
+                    <Seg label="Mask shape" value={maskStyle.shape} onChange={sh => setMaskStyle(st => ({ ...st, shape: sh }))}
+                      options={[{ value: "ellipse", label: "Oval" }, { value: "rect", label: "Rectangle" }]} />
+                    {maskStyle.type === "box" ? (
+                      <Field label="Colour">{colourSwatches(maskStyle.color, c => setMaskStyle(st => ({ ...st, color: c })), "Mask colour")}</Field>
+                    ) : (
+                      <Range label={maskStyle.type === "blur" ? "Blur strength" : "Block size"} value={maskStyle.strength} min={1} max={100} fmt={v => `${v}%`}
+                        onChange={v => setMaskStyle(st => ({ ...st, strength: v }))} />
+                    )}
+                    <Range label="Soft edge" value={maskStyle.feather} min={0} max={100} fmt={v => `${v}%`}
+                      onChange={v => setMaskStyle(st => ({ ...st, feather: v }))} />
+                    {autoMaskEnabled && (
+                      <Range label="Extra cover around faces" value={maskStyle.padding} min={0} max={60} fmt={v => `${v}%`}
+                        onChange={v => setMaskStyle(st => ({ ...st, padding: v }))} />
+                    )}
+                    {(masks.length > 0 || (mode === "video" && faceTrack.length > 0)) && (
+                      <ArmedBtn className="sm" onConfirm={clearAllMasks}>Clear all masks</ArmedBtn>
+                    )}
+                  </section>
+                )}
+              </>
+            )}
+
+            {panel === "export" && (
+              <>
+                <section className="card">
+                  <h2>Export</h2>
+                  <Field label="File name prefix" htmlFor="exp-prefix"><TextInput id="exp-prefix" value={exportPrefix} onChange={setExportPrefix} placeholder="watermarked_" /></Field>
+                  {bulkProgress && <Progress label={exportMsg || "Exporting…"} meta={`${bulkProgress.done} of ${bulkProgress.total}`} pct={(bulkProgress.done / bulkProgress.total) * 100} />}
+                  {exporting && <Progress label="Recording video" meta={`${expPct}%`} pct={expPct} />}
+                  {mode === "image" && images.length > 1 && (
+                    <div className="btn-row">
+                      <button type="button" className="btn" onClick={exportSingleImage} disabled={!imgReady}><Download aria-hidden="true" />Export this image only</button>
+                    </div>
+                  )}
+                  <p className="hint">
+                    {!mode ? "Add media first. " : ""}
+                    PNG images stay PNG; other images save as JPG. Videos save as WebM.
+                  </p>
+                </section>
+                <section className="card">
+                  <h2>Settings file</h2>
+                  <p className="hint">Save the watermark and mask settings to use them again later.</p>
+                  <div className="btn-row">
+                    <button type="button" className="btn sm" onClick={exportConfigJson}><FileJson aria-hidden="true" />Save settings</button>
+                    <button type="button" className="btn sm" onClick={() => document.getElementById("__ic")?.click()}><Upload aria-hidden="true" />Load settings</button>
+                  </div>
+                </section>
+              </>
             )}
           </div>
+        </div>
+      </main>
 
-          {mode === "image" && images.length > 0 && (
-            <div style={{ flexShrink: 0, borderTop: `1px solid ${C.border}`, background: C.panel, padding: "12px 16px" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-                <div style={{ fontSize: 9, letterSpacing: 2.5, textTransform: "uppercase", color: C.muted }}>Image Gallery</div>
-                <span style={{ fontSize: 9, color: C.gold }}>{images.length} file{images.length !== 1 ? "s" : ""}</span>
-                <button onClick={() => { images.forEach(img => URL.revokeObjectURL(img.src)); setImages([]); setMode(null); setImgReady(false); }} style={{ marginLeft: "auto", fontSize: 9, color: C.muted, background: "transparent", border: `1px solid ${C.border}`, borderRadius: 5, padding: "3px 9px", cursor: "pointer" }}>CLEAR ALL</button>
-                {images.length < MAX_FILES && <button onClick={() => document.getElementById("__mi")?.click()} style={{ fontSize: 9, color: C.gold, background: C.goldBg, border: `1px solid ${C.goldDim}`, borderRadius: 5, padding: "3px 9px", cursor: "pointer" }}>+ ADD MORE</button>}
-              </div>
-              <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4 }}>
-                {images.map((img, idx) => (
-                  <div key={img.src} onClick={() => setSelectedIdx(idx)} style={{ position: "relative", flexShrink: 0, width: 88, borderRadius: 7, overflow: "hidden", border: `2px solid ${selectedIdx === idx ? C.gold : C.border}`, cursor: "pointer", transition: "border-color .15s", background: C.card }}>
-                    <img src={img.src} alt={img.file.name} style={{ display: "block", width: "100%", height: "auto", maxHeight: 62, objectFit: "cover" }} />
-                    {img.w > 0 && <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, background: "rgba(7,8,15,.82)", padding: "2px 4px", fontSize: 7, color: C.gold, textAlign: "center" }}>{img.w}×{img.h}</div>}
-                    {selectedIdx === idx && <div style={{ position: "absolute", top: 4, left: 4, width: 14, height: 14, borderRadius: "50%", background: C.gold, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, color: C.bg, fontWeight: 700 }}>✓</div>}
-                    <button onClick={e => { e.stopPropagation(); removeImage(idx); }} style={{ position: "absolute", top: 3, right: 3, width: 16, height: 16, borderRadius: "50%", background: "rgba(248,113,113,.9)", border: "none", cursor: "pointer", fontSize: 9, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700 }}>✕</button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </main>
-      </div>
+      <input id="__mi" type="file" accept="image/*,video/*" multiple hidden onChange={e => { if (e.target.files) ingestFiles(e.target.files); e.target.value = ""; }} />
+      <input id="__wi" type="file" accept="image/*" hidden onChange={e => e.target.files?.[0] && setWmImgFile(e.target.files[0])} />
+      <input id="__ic" type="file" accept=".json" hidden onChange={e => { if (e.target.files?.[0]) importConfigJson(e.target.files[0]); e.target.value = ""; }} />
 
       {activeImg && (
         <img key={activeImg.src} src={activeImg.src} alt="" crossOrigin="anonymous"
@@ -860,6 +942,8 @@ export default function ObscuraX() {
           style={{ position: "fixed", top: -9999, left: -9999, opacity: 0, pointerEvents: "none", width: 1, height: 1 }}
         />
       )}
+
+      {toastMsg && <div className="toast" role="status">{toastMsg}</div>}
     </div>
   );
 }
