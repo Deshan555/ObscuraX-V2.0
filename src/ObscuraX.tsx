@@ -1,15 +1,15 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import JSZip from "jszip/dist/jszip.min.js";
 
-import { ImageEntry, BulkProgress, WatermarkConfig, Mask, MaskStyle, DetectSettings, TrackSample } from "./types";
+import { ImageEntry, BulkProgress, WatermarkConfig, Mask, MaskStyle, DetectSettings, TrackSample, TrackInfo } from "./types";
 import { WM, PRESETS, FONTS, PALETTE, MAX_FILES, FILTERS, DEFAULT_MASK_STYLE, DEFAULT_DETECT_SETTINGS } from "./constants/config";
-import { applyWatermark, applyMasks } from "./utils/canvas";
-import { loadFaceModels, detectFaces, facesToMasks, boxesAt, seekVideo } from "./utils/faceDetection";
+import { applyWatermark, applyMasks, maskRect } from "./utils/canvas";
+import { loadFaceModels, detectFaces, facesToMasks, boxesAt, seekVideo, overlap, cropThumb, createTrackLinker } from "./utils/faceDetection";
 import { detectImageResolution } from "./helpers/media";
-import { Field, TextInput, Select, SwitchRow, Range, Seg, ArmedBtn, Spinner, Progress } from "./components/common/Atoms";
+import { Field, TextInput, Select, SwitchRow, Range, Seg, ArmedBtn, Spinner, Progress, Modal } from "./components/common/Atoms";
 import { useTheme } from "./hooks/useTheme";
 import {
-  ImageIcon, Type, ScanFace, Download, Upload, Sun, Moon, Monitor, Play, Pause, Volume2, VolumeX, X, Check, FileJson,
+  Type, ScanFace, SlidersHorizontal, Eye, EyeOff, Trash2, SquareDashed, Download, Upload, ImagePlus, Plus, Minus, Maximize, Sun, Moon, Monitor, Play, Pause, Volume2, VolumeX, X, Check, FileJson,
   ArrowUpLeft, ArrowUp, ArrowUpRight, ArrowLeft, Dot, ArrowRight, ArrowDownLeft, ArrowDown, ArrowDownRight, LucideIcon,
 } from "lucide-react";
 
@@ -24,20 +24,28 @@ const MODEL_MISSING_MSG = "The face model hasn't loaded, so faces can't be found
 
 type TrackStatus = "idle" | "scanning" | "ready" | "stale";
 
-type Panel = "media" | "watermark" | "masking" | "export";
-const NAV: { id: Panel; label: string; Icon: LucideIcon }[] = [
-  { id: "media", label: "Media", Icon: ImageIcon },
-  { id: "watermark", label: "Watermark", Icon: Type },
-  { id: "masking", label: "Face masking", Icon: ScanFace },
-  { id: "export", label: "Export", Icon: Download },
+type Tool = "mask" | "watermark" | "adjust";
+const TOOLS: { id: Tool; label: string; key: string; Icon: LucideIcon }[] = [
+  { id: "mask", label: "Face blur", key: "F", Icon: ScanFace },
+  { id: "watermark", label: "Watermark", key: "W", Icon: Type },
+  { id: "adjust", label: "Adjust", key: "A", Icon: SlidersHorizontal },
 ];
-const PANEL_TITLES: Record<Panel, string> = { media: "Media", watermark: "Watermark", masking: "Face masking", export: "Export" };
 
 const POSITION_ICONS: Record<string, { Icon: LucideIcon; label: string }> = {
   tl: { Icon: ArrowUpLeft, label: "Top left" }, tc: { Icon: ArrowUp, label: "Top centre" }, tr: { Icon: ArrowUpRight, label: "Top right" },
   ml: { Icon: ArrowLeft, label: "Middle left" }, cc: { Icon: Dot, label: "Centre" }, mr: { Icon: ArrowRight, label: "Middle right" },
   bl: { Icon: ArrowDownLeft, label: "Bottom left" }, bc: { Icon: ArrowDown, label: "Bottom centre" }, br: { Icon: ArrowDownRight, label: "Bottom right" },
 };
+
+/** Video face masks are `track-<id>`; returns the id, or null for other masks. */
+const trackIdOf = (maskId: string) => (maskId.startsWith("track-") ? Number(maskId.slice(6)) : null);
+
+/** New auto masks for an image; faces the user turned off stay off when detection reruns. */
+function mergeAutoMasks(prev: Mask[], autos: Mask[]): Mask[] {
+  const offBefore = prev.filter(m => m.isAuto && m.off);
+  const merged = autos.map(a => offBefore.some(o => { const ov = overlap(a, o); return ov.iou > 0.3 || ov.contain > 0.6; }) ? { ...a, off: true } : a);
+  return [...merged, ...prev.filter(m => !m.isAuto)];
+}
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 const fmtTime = (t: number) => `${Math.floor(t / 60)}:${Math.floor(t % 60).toString().padStart(2, "0")}`;
@@ -79,12 +87,18 @@ export default function ObscuraX() {
   const [masks, setMasks] = useState<Mask[]>([]);
   const [maskStyle, setMaskStyle] = useState<MaskStyle>(DEFAULT_MASK_STYLE);
   const [detectSettings, setDetectSettings] = useState<DetectSettings>(DEFAULT_DETECT_SETTINGS);
-  const [maskingMode, setMaskingMode] = useState(false);
+  // Face blur on/off (auto-detection and export scanning). Independent of the active tool.
+  const [maskingMode, setMaskingMode] = useState(true);
+  const [tool, setTool] = useState<Tool>("mask");
   const [activePreset, setActivePreset] = useState<string | null>("bc");
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelError, setModelError] = useState(false);
   const [autoMaskEnabled, setAutoMaskEnabled] = useState(true);
   const [faceTrack, setFaceTrack] = useState<TrackSample[]>([]);
+  const [trackInfo, setTrackInfo] = useState<TrackInfo[]>([]);
+  const [hiddenTracks, setHiddenTracks] = useState<number[]>([]);
+  const [selectedMaskId, setSelectedMaskId] = useState<string | null>(null);
+  const [hoverMaskId, setHoverMaskId] = useState<string | null>(null);
   const [trackStatus, setTrackStatus] = useState<TrackStatus>("idle");
   const [scan, setScan] = useState<{ label: string; pct: number } | null>(null);
   const scanToken = useRef(0);
@@ -142,7 +156,7 @@ export default function ObscuraX() {
     setVideoSrc(url); setVideoReady(false);
     // New video: drop the previous video's masks and face track, cancel any scan.
     scanToken.current++;
-    setMasks([]); setFaceTrack([]); setTrackStatus("idle"); setScan(null);
+    setMasks([]); setFaceTrack([]); setTrackInfo([]); setHiddenTracks([]); setTrackStatus("idle"); setScan(null);
     return () => URL.revokeObjectURL(url);
   }, [videoFile]);
 
@@ -153,6 +167,12 @@ export default function ObscuraX() {
     wmFilter,
     wmBlur,
   }), [wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, wmFilter, wmBlur]);
+
+  /** Face masks at time t of the video; faces the user turned off come back with `off`. */
+  const videoFaceMasks = useCallback((t: number) => facesToMasks(boxesAt(faceTrack, t)).map(m => {
+    const tid = trackIdOf(m.id);
+    return tid != null && hiddenTracks.includes(tid) ? { ...m, off: true } : m;
+  }), [faceTrack, hiddenTracks]);
 
   const draw = useCallback(() => {
     const cvs = canvasRef.current;
@@ -170,11 +190,11 @@ export default function ObscuraX() {
     ctx.filter = "none";
     let active = masks;
     if (mode === "video" && autoMaskEnabled && faceTrack.length) {
-      active = [...facesToMasks(boxesAt(faceTrack, (med as HTMLVideoElement).currentTime)), ...masks];
+      active = [...videoFaceMasks((med as HTMLVideoElement).currentTime), ...masks];
     }
     applyMasks(ctx, cvs.width, cvs.height, active, maskStyle);
     applyWatermark(ctx, cvs.width, cvs.height, cfg);
-  }, [mode, imgReady, videoReady, wmConfig, masks, autoMaskEnabled, faceTrack, maskStyle]);
+  }, [mode, imgReady, videoReady, wmConfig, masks, autoMaskEnabled, faceTrack, maskStyle, videoFaceMasks]);
 
   const drawRef = useRef(draw);
   useEffect(() => { drawRef.current = draw; }, [draw]);
@@ -213,7 +233,7 @@ export default function ObscuraX() {
   /** Replaces auto masks on an image. Keyed by src because indices can shift while detection runs. */
   const setAutoMasks = useCallback((src: string, autos: Mask[]) => {
     setImages(prev => prev.map(img => img.src === src
-      ? { ...img, scanned: true, masks: [...autos, ...img.masks.filter(m => !m.isAuto)] }
+      ? { ...img, scanned: true, masks: mergeAutoMasks(img.masks, autos) }
       : img));
   }, []);
 
@@ -277,6 +297,8 @@ export default function ObscuraX() {
     const lastT = Math.max(0, vid.duration - 0.05);
     const n = Math.max(2, Math.ceil(lastT * fps) + 1);
     const samples: TrackSample[] = [];
+    const link = createTrackLinker();
+    const info = new Map<number, TrackInfo>();
     try {
       for (let i = 0; i < n; i++) {
         if (token !== scanToken.current) return false;
@@ -284,7 +306,13 @@ export default function ObscuraX() {
         if (samples.length && t <= samples[samples.length - 1].t) continue;
         await seekVideo(vid, t);
         if (token !== scanToken.current) return false;
-        samples.push({ t, boxes: await detectFaces(vid, detectOpts) });
+        const { boxes } = link(t, await detectFaces(vid, detectOpts));
+        for (const b of boxes) {
+          const ti = info.get(b.id!);
+          if (ti) { ti.samples++; ti.score = Math.max(ti.score, b.score); }
+          else info.set(b.id!, { id: b.id!, thumb: cropThumb(vid, b), score: b.score, samples: 1, firstT: t, firstBox: b });
+        }
+        samples.push({ t, boxes });
         setScan({ label: `Tracking faces… ${i + 1} of ${n}`, pct: Math.round(((i + 1) / n) * 100) });
       }
     } catch (err) {
@@ -293,11 +321,17 @@ export default function ObscuraX() {
       return false;
     }
     if (token !== scanToken.current) return false;
-    setFaceTrack(samples); setTrackStatus("ready"); setScan(null);
+    // Faces turned off before a rescan stay off: find the face now at the same place and time.
+    const carried = trackInfo.filter(ti => hiddenTracks.includes(ti.id)).flatMap(old => {
+      const hit = boxesAt(samples, old.firstT).find(b => { const o = overlap(b, old.firstBox); return o.iou > 0.3 || o.contain > 0.6; });
+      return hit?.id != null ? [hit.id] : [];
+    });
+    setFaceTrack(samples); setTrackInfo([...info.values()]); setHiddenTracks([...new Set(carried)]);
+    setTrackStatus("ready"); setScan(null);
     await seekVideo(vid, t0);
     if (wasPlaying) setVideoPaused(false);
     return true;
-  }, [modelsLoaded, detectSettings.scanFps, detectOpts]);
+  }, [modelsLoaded, detectSettings.scanFps, detectOpts, trackInfo, hiddenTracks]);
 
   const cancelScan = () => {
     scanToken.current++;
@@ -321,7 +355,7 @@ export default function ObscuraX() {
 
   const clearAllMasks = () => {
     if (mode === "image") updateMasks(() => []);
-    else { scanToken.current++; setScan(null); setMasks([]); setFaceTrack([]); setTrackStatus("ready"); }
+    else { scanToken.current++; setScan(null); setMasks([]); setFaceTrack([]); setTrackInfo([]); setHiddenTracks([]); setTrackStatus("ready"); }
   };
 
   const onImgLoad = useCallback((el: HTMLImageElement) => {
@@ -381,15 +415,32 @@ export default function ObscuraX() {
     return { x: Math.max(0, Math.min(1, (cx - rect.left) / rect.width)), y: Math.max(0, Math.min(1, (cy - rect.top) / rect.height)) };
   };
 
+  /** Masks visible right now: the image's masks, or this video frame's faces plus drawn areas. */
+  const masksOnScreen = (): Mask[] =>
+    mode === "video" && autoMaskEnabled && faceTrack.length ? [...videoFaceMasks(vidElRef.current?.currentTime ?? 0), ...masks] : masks;
+
+  /** Smallest mask under a point, so a face inside a big drawn area can still be picked. */
+  const hitMask = (pos: { x: number; y: number }) => {
+    let best: Mask | null = null, bestArea = Infinity;
+    for (const m of masksOnScreen()) {
+      const r = maskRect(m, maskStyle);
+      if (pos.x >= r.x && pos.x <= r.x + r.w && pos.y >= r.y && pos.y <= r.y + r.h && r.w * r.h < bestArea) { best = m; bestArea = r.w * r.h; }
+    }
+    return best;
+  };
+
   const onPtrDown = (e: React.MouseEvent | React.TouchEvent) => {
     dragging.current = true;
     const pos = posFromEvent(e);
-    if (maskingMode) {
+    if (tool === "mask") {
+      const hit = hitMask(pos);
+      if (hit) { dragging.current = false; setSelectedMaskId(hit.id); return; }
+      setSelectedMaskId(null);
       maskStart.current = pos;
       const id = `m-${Date.now()}`;
       drawingId.current = id;
       updateMasks(prev => [...prev, { id, ...pos, w: 0, h: 0, type: maskStyle.type, isAuto: false }]);
-    } else { setActivePreset(null); setWmPos(pos); }
+    } else if (tool === "watermark") { setActivePreset(null); setWmPos(pos); }
   };
 
   const onPtrMove = (e: React.MouseEvent | React.TouchEvent) => {
@@ -397,15 +448,16 @@ export default function ObscuraX() {
     e.preventDefault();
     const pos = posFromEvent(e);
     const start = maskStart.current, id = drawingId.current;
-    if (maskingMode && start && id) {
+    if (tool === "mask" && start && id) {
       updateMasks(prev => prev.map(m => m.id === id ? { ...m, w: pos.x - start.x, h: pos.y - start.y } : m));
-    } else if (!maskingMode) { setWmPos(pos); }
+    } else if (tool === "watermark") { setWmPos(pos); }
   };
 
   const onPtrUp = () => {
     const id = drawingId.current;
     dragging.current = false; maskStart.current = null; drawingId.current = null;
-    if (!maskingMode || !id) return;
+    if (!id) return;
+    setSelectedMaskId(id);
     // Normalise negative sizes from dragging up/left; drop accidental clicks.
     updateMasks(prev => prev.flatMap(m => {
       if (m.id !== id) return [m];
@@ -460,11 +512,11 @@ export default function ObscuraX() {
     }, isPng ? "image/png" : "image/jpeg", 0.96);
   };
 
-  const exportBulkZip = async () => {
-    if (!images.length) return;
+  const exportBulkZip = async (): Promise<boolean> => {
+    if (!images.length) return false;
     // Faces in images the user never opened must still be masked.
     const autoScan = maskingMode && autoMaskEnabled;
-    if (autoScan && !modelsLoaded) { setFileError(MODEL_MISSING_MSG); return; }
+    if (autoScan && !modelsLoaded) { setFileError(MODEL_MISSING_MSG); return false; }
     setFileError("");
     setBulkProgress({ done: 0, total: images.length }); setExportMsg("Building ZIP…");
     const zip = new JSZip(); const folder = zip.folder("watermarked"); const cfg = wmConfig();
@@ -477,7 +529,7 @@ export default function ObscuraX() {
         if (autoScan && !entry.scanned) {
           setExportMsg(`Finding faces ${i + 1} of ${images.length}…`);
           const autos = facesToMasks(await detectFaces(imgEl, detectOpts));
-          entryMasks = [...autos, ...entryMasks.filter(m => !m.isAuto)];
+          entryMasks = mergeAutoMasks(entryMasks, autos);
           setAutoMasks(entry.src, autos);
         }
         const offscr = document.createElement("canvas"); offscr.width = imgEl.naturalWidth; offscr.height = imgEl.naturalHeight;
@@ -494,12 +546,13 @@ export default function ObscuraX() {
       console.error("ObscuraX: Bulk export failed:", err);
       setFileError("Export stopped because an image couldn't be processed. Nothing was saved. Try again, or remove that image.");
       setBulkProgress(null); setExportMsg("");
-      return;
+      return false;
     }
     setBulkProgress({ done: images.length, total: images.length }); setExportMsg("Compressing…");
     const zipBlob = await zip.generateAsync({ type: "blob" }, (meta: { percent: number }) => setExpPct(Math.round(meta.percent)));
     const a = document.createElement("a"); a.href = URL.createObjectURL(zipBlob); a.download = `${exportPrefix}images.zip`; a.click();
     setBulkProgress(null); setExportMsg(""); setExpPct(0); showToast("ZIP downloaded");
+    return true;
   };
 
   const exportVideo = async () => {
@@ -535,26 +588,132 @@ export default function ObscuraX() {
 
   // ── View ────────────────────────────────────────────────────────────────────
   const { mode: themeMode, cycle: cycleTheme } = useTheme();
-  const [panel, setPanel] = useState<Panel>("media");
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportScope, setExportScope] = useState<"all" | "current">("all");
 
-  // Keep --head-h current so sticky content sits below the header.
-  const headerRef = useRef<HTMLElement | null>(null);
+  // The canvas hint ("Drag to …") appears for a few seconds after a tool or file change.
+  const [hintKey, setHintKey] = useState<string | null>(null);
   useEffect(() => {
-    const el = headerRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(() => document.documentElement.style.setProperty("--head-h", `${el.offsetHeight}px`));
-    ro.observe(el);
+    const key = `${tool}|${activeSrc ?? videoSrc ?? ""}`;
+    setHintKey(key);
+    const t = setTimeout(() => setHintKey(k => (k === key ? null : k)), 3000);
+    return () => clearTimeout(t);
+  }, [tool, activeSrc, videoSrc]);
+
+  // Zoom: null fits the image to the workspace; a number is a fixed scale.
+  const [zoom, setZoom] = useState<number | null>(null);
+  const [shownScale, setShownScale] = useState(1);
+  const stageRef = useRef<HTMLElement | null>(null);
+  const [canvasBox, setCanvasBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  useEffect(() => {
+    const c = canvasRef.current, st = stageRef.current;
+    if (!c || !st) return;
+    const measure = () => {
+      if (c.width) setShownScale(c.clientWidth / c.width);
+      setCanvasBox({ left: c.offsetLeft, top: c.offsetTop, width: c.offsetWidth, height: c.offsetHeight });
+    };
+    const ro = new ResizeObserver(measure);
+    ro.observe(c); ro.observe(st);
     return () => ro.disconnect();
-  }, []);
+  }, [mode]);
+  useEffect(() => { setZoom(null); }, [activeSrc, videoSrc]);
+  const zoomBy = useCallback((f: number) => setZoom(z => Math.min(8, Math.max(0.05, (z ?? shownScale) * f))), [shownScale]);
+
+  // Latest selection actions for the key handler, without re-binding it every render.
+  const selectionKeys = useRef<{ remove?: () => void; deselect?: () => void }>({});
+
+  // Shortcuts: F / W / A pick a tool; Ctrl/⌘ + = / − / 0 zoom; Delete / Esc act on the selected mask.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (exportOpen) return;
+      if (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable]")) return;
+      const mod = e.metaKey || e.ctrlKey;
+      if ((e.key === "Delete" || e.key === "Backspace") && selectionKeys.current.remove) { e.preventDefault(); selectionKeys.current.remove(); return; }
+      if (e.key === "Escape" && selectionKeys.current.deselect) { selectionKeys.current.deselect(); return; }
+      if (mod && (e.key === "=" || e.key === "+")) { e.preventDefault(); zoomBy(1.25); }
+      else if (mod && e.key === "-") { e.preventDefault(); zoomBy(0.8); }
+      else if (mod && e.key === "0") { e.preventDefault(); setZoom(null); }
+      else if (!mod && !e.altKey) {
+        const t = TOOLS.find(x => x.key.toLowerCase() === e.key.toLowerCase());
+        if (t) setTool(t.id);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [exportOpen, zoomBy]);
 
   const ready = mode === "video" ? videoReady : imgReady;
-  const autoFaces = masks.filter(m => m.isAuto).length;
-  const drawnMasks = masks.length - autoFaces;
-  const peakFaces = faceTrack.reduce((mx, smp) => Math.max(mx, smp.boxes.length), 0);
-  const modelLoading = maskingMode && autoMaskEnabled && !modelsLoaded && !modelError;
-  const mediaName = mode === "video" ? videoFile?.name ?? "the video" : activeImg?.file.name ?? "this image";
-  const ratio = canvasDims.h ? (canvasDims.w / canvasDims.h).toFixed(2) : "";
 
+  // ── Blurred areas: list + selection ──
+  useEffect(() => { setSelectedMaskId(null); setHoverMaskId(null); }, [activeSrc, videoSrc]);
+  const thumbCache = useRef(new Map<string, string>());
+  type AreaItem = { id: string; name: string; sub: string; thumb?: string; off: boolean; kind: "face" | "drawn"; seekTo?: number };
+  const areaItems: AreaItem[] = [];
+  const drawnItems = masks.filter(m => !m.isAuto);
+  if (mode === "video") {
+    trackInfo.forEach((ti, i) => areaItems.push({
+      id: `track-${ti.id}`, name: `Face ${i + 1}`, kind: "face", thumb: ti.thumb, off: hiddenTracks.includes(ti.id), seekTo: ti.firstT,
+      sub: `${Math.round(ti.score * 100)}% sure · ${Math.max(1, Math.round(ti.samples / detectSettings.scanFps))} s on screen`,
+    }));
+  } else if (mode === "image") {
+    const imgEl = imgReady ? imgElRef.current : null;
+    [...masks.filter(m => m.isAuto)].sort((a, b) => a.x - b.x).forEach((m, i) => {
+      let thumb: string | undefined;
+      if (imgEl && activeSrc) {
+        const key = `${activeSrc}|${m.x.toFixed(4)},${m.y.toFixed(4)},${m.w.toFixed(4)},${m.h.toFixed(4)}`;
+        thumb = thumbCache.current.get(key);
+        if (!thumb) { thumb = cropThumb(imgEl, m); thumbCache.current.set(key, thumb); }
+      }
+      areaItems.push({
+        id: m.id, name: `Face ${i + 1}`, kind: "face", thumb, off: !!m.off,
+        sub: `${Math.round((m.score ?? 0) * 100)}% sure · ${Math.round(m.w * canvasDims.w)} × ${Math.round(m.h * canvasDims.h)} px`,
+      });
+    });
+  }
+  drawnItems.forEach((m, i) => areaItems.push({
+    id: m.id, name: `Drawn area ${i + 1}`, kind: "drawn", off: false,
+    sub: `${Math.round(Math.abs(m.w) * canvasDims.w)} × ${Math.round(Math.abs(m.h) * canvasDims.h)} px`,
+  }));
+  const itemById = new Map(areaItems.map(it => [it.id, it]));
+  const onScreen = mode && ready ? masksOnScreen() : [];
+  const selectedMask = onScreen.find(m => m.id === selectedMaskId) ?? null;
+  const selectedItem = selectedMaskId ? itemById.get(selectedMaskId) ?? null : null;
+
+  const setAreaOff = (id: string, off: boolean) => {
+    const tid = trackIdOf(id);
+    if (tid != null) setHiddenTracks(h => (off ? [...new Set([...h, tid])] : h.filter(x => x !== tid)));
+    else updateMasks(prev => prev.map(m => (m.id === id ? { ...m, off } : m)));
+  };
+  const deleteArea = (id: string) => {
+    updateMasks(prev => prev.filter(m => m.id !== id));
+    setSelectedMaskId(sel => (sel === id ? null : sel));
+  };
+  const pickArea = (it: AreaItem) => {
+    setSelectedMaskId(it.id);
+    // In a video, jump to where the face first appears so it can be seen.
+    if (it.seekTo != null && vidElRef.current) { vidElRef.current.currentTime = it.seekTo; setVideoTime(it.seekTo); }
+  };
+  useEffect(() => {
+    selectionKeys.current = selectedItem ? {
+      remove: () => (selectedItem.kind === "drawn" ? deleteArea(selectedItem.id) : setAreaOff(selectedItem.id, !selectedItem.off)),
+      deselect: () => setSelectedMaskId(null),
+    } : {};
+  });
+
+  const autoFaces = masks.filter(m => m.isAuto && !m.off).length;
+  const autoTotal = masks.filter(m => m.isAuto).length;
+  const drawnMasks = masks.length - autoTotal;
+  const peakFaces = faceTrack.reduce((mx, smp) => Math.max(mx, smp.boxes.filter(b => !hiddenTracks.includes(b.id ?? -1)).length), 0);
+  const faceBlurOn = maskingMode && autoMaskEnabled;
+  const modelLoading = faceBlurOn && !modelsLoaded && !modelError;
+  const mediaName = mode === "video" ? videoFile?.name ?? "Video" : activeImg?.file.name ?? "Image";
+  const exportAll = mode === "image" && images.length > 1 && exportScope === "all";
+  const busy = exporting || !!bulkProgress;
+
+  const setFaceBlur = (on: boolean) => {
+    setMaskingMode(on);
+    toggleAutoMask(on);
+  };
   const clearImages = () => {
     images.forEach(img => URL.revokeObjectURL(img.src));
     setImages([]); setMode(null); setImgReady(false);
@@ -564,57 +723,39 @@ export default function ObscuraX() {
     setScan(null); setVideoFile(null); setVideoSrc(null); setVideoReady(false); setMode(null);
     setMasks([]); setFaceTrack([]); setTrackStatus("idle");
   };
+  const openExport = () => { setFileError(""); setExportOpen(true); };
+  const runExport = async () => {
+    if (mode === "video") { setExportOpen(false); await exportVideo(); return; }
+    if (exportAll) { if (await exportBulkZip()) setExportOpen(false); return; }
+    exportSingleImage();
+    setExportOpen(false);
+  };
 
-  // Hero: the one answer this screen gives, how many faces are covered.
-  let heroBig = "0", heroUnit: string | null = "faces", heroSub = "Add an image or a video to start.";
-  if (mode && !maskingMode) {
-    heroBig = "Off"; heroUnit = null; heroSub = "Turn on face masking to find and cover faces.";
-  } else if (mode === "image") {
-    if (autoMaskEnabled && !activeScanned) {
-      heroBig = "…"; heroUnit = null; heroSub = `Looking for faces in ${mediaName}`;
-    } else {
-      heroBig = String(autoFaces); heroUnit = autoFaces === 1 ? "face" : "faces";
-      heroSub = autoMaskEnabled ? `found in ${mediaName}` : "Finding faces is off.";
-    }
-  } else if (mode === "video") {
-    if (trackStatus === "scanning") {
-      heroBig = String(scan?.pct ?? 0); heroUnit = "%"; heroSub = "Tracking faces through the video…";
-    } else if (!autoMaskEnabled) {
-      heroBig = "0"; heroSub = "Finding faces is off.";
-    } else if (trackStatus === "ready") {
-      heroBig = String(peakFaces); heroUnit = peakFaces === 1 ? "face" : "faces";
-      heroSub = faceTrack.length ? "at most in one frame, followed through the video" : "Face track cleared.";
-    } else {
-      heroBig = "–"; heroUnit = null;
-      heroSub = trackStatus === "stale" ? "Settings changed. Rescan to update the face track." : "The video hasn't been scanned yet.";
-    }
+  // Status for the dock: what the face blur is doing right now.
+  let faceStatus: { text: string; spin?: boolean; ok?: boolean } | null = null;
+  if (mode) {
+    if (!faceBlurOn) faceStatus = { text: drawnMasks ? plural(drawnMasks, "drawn area") : "Face blur off" };
+    else if (modelLoading) faceStatus = { text: "Loading face model…", spin: true };
+    else if (modelError) faceStatus = { text: "Face model unavailable" };
+    else if (mode === "image") {
+      faceStatus = !activeScanned
+        ? { text: "Finding faces…", spin: true }
+        : { text: `${autoFaces < autoTotal ? `${autoFaces} of ${autoTotal} faces` : plural(autoFaces, "face")} covered${drawnMasks ? ` · ${plural(drawnMasks, "drawn area")}` : ""}`, ok: true };
+    } else if (trackStatus === "scanning") faceStatus = { text: `Tracking faces… ${scan?.pct ?? 0}%`, spin: true };
+    else if (trackStatus === "ready") faceStatus = { text: faceTrack.length ? `Up to ${plural(peakFaces, "face")} per frame covered` : "Face track cleared", ok: faceTrack.length > 0 };
+    else faceStatus = { text: trackStatus === "stale" ? "Rescan needed" : "Not scanned yet" };
   }
-  if (mode && maskingMode && drawnMasks > 0) heroSub += ` · ${plural(drawnMasks, "drawn mask")}`;
 
   let activity: string | null = null;
-  if (modelLoading) activity = "Loading face model…";
-  else if (scan) activity = scan.label;
-  else if (mode === "image" && maskingMode && autoMaskEnabled && modelsLoaded && !activeScanned) activity = "Finding faces…";
-
-  const exportAction = mode === "video"
-    ? { label: exporting ? `Recording… ${expPct}%` : "Export video", run: exportVideo, busy: exporting, disabled: !videoReady || exporting || trackStatus === "scanning" }
-    : images.length > 1
-      ? { label: bulkProgress ? exportMsg || "Exporting…" : `Export all (${images.length})`, run: exportBulkZip, busy: !!bulkProgress, disabled: !!bulkProgress || !!scan }
-      : { label: "Export image", run: exportSingleImage, busy: false, disabled: !imgReady };
+  if (exporting) activity = `Recording video… ${expPct}%`;
+  else if (scan && mode === "video") activity = scan.label;
 
   const pickFiles = () => document.getElementById("__mi")?.click();
-  const renderDrop = (large: boolean) => (
-    <button type="button" className={`drop${large ? " lg" : ""}${dropActive ? " over" : ""}`} onClick={pickFiles}
-      onDragOver={e => { e.preventDefault(); setDropActive(true); }}
-      onDragLeave={() => setDropActive(false)}
-      onDrop={onMediaDrop}>
-      <Upload aria-hidden="true" />
-      <span className="t">
-        {large ? "Drop images or a video here" : images.length ? `Add more images (${images.length} of ${MAX_FILES})` : "Add images or a video"}
-      </span>
-      <span className="sub">{large ? `Or click to choose. Up to ${MAX_FILES} images, or one video.` : `JPG, PNG, GIF, MP4 or WebM · up to ${MAX_FILES} images`}</span>
-    </button>
-  );
+  const dropProps = {
+    onDragOver: (e: React.DragEvent) => { e.preventDefault(); setDropActive(true); },
+    onDragLeave: (e: React.DragEvent) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDropActive(false); },
+    onDrop: onMediaDrop,
+  };
 
   const colourSwatches = (value: string, onChange: (c: string) => void, label: string) => (
     <div className="swatches" role="group" aria-label={label}>
@@ -627,301 +768,373 @@ export default function ObscuraX() {
 
   const ThemeIcon = themeMode === "light" ? Sun : themeMode === "dark" ? Moon : Monitor;
   const themeLabel = themeMode === "light" ? "Light mode" : themeMode === "dark" ? "Dark mode" : "Match computer";
+  const toolHint = tool === "mask" ? "Drag to blur any area" : tool === "watermark" ? "Drag to move the watermark" : null;
+  const showHint = hintKey === `${tool}|${activeSrc ?? videoSrc ?? ""}`;
+  const filterThumb = activeImg?.src;
 
   return (
-    <div className="app">
-      <aside className="nav">
-        <div className="brand">ObscuraX</div>
-        <div className="brand-sub">Blur faces, add watermarks</div>
-        <nav className="nav-list" aria-label="Sections">
-          {NAV.map(({ id, label, Icon }) => (
-            <button key={id} type="button" className="nav-item" aria-current={panel === id ? "page" : undefined} onClick={() => setPanel(id)}>
-              <Icon aria-hidden="true" />
-              <span className="nav-label">{label}</span>
-              {id === "media" && images.length > 0 && <span className="nbadge" aria-label={plural(images.length, "image")}>{images.length}</span>}
-            </button>
-          ))}
-        </nav>
-        <div className="nav-end">
-          <button type="button" className="nav-item" onClick={cycleTheme} aria-label={`Colour mode: ${themeLabel}. Click to change.`} title="Change colour mode">
+    <div className="editor">
+      {/* ── Tool rail ── */}
+      <nav className="rail" aria-label="Tools">
+        <div className="rail-logo" aria-hidden="true">OX</div>
+        <div className="rail-sep" />
+        {TOOLS.map(({ id, label, key, Icon }) => (
+          <button key={id} type="button" className="rail-btn" aria-pressed={tool === id} aria-label={label} title={`${label} (${key})`} onClick={() => setTool(id)}>
+            <Icon aria-hidden="true" />
+          </button>
+        ))}
+        <div className="rail-end">
+          <button type="button" className="rail-btn" onClick={cycleTheme} aria-label={`Colour mode: ${themeLabel}. Click to change.`} title={`${themeLabel} (click to change)`}>
             <ThemeIcon aria-hidden="true" />
-            <span className="nav-label">{themeLabel}</span>
           </button>
         </div>
+      </nav>
+
+      {/* ── Top bar ── */}
+      <header className="topbar">
+        <span className="brand">ObscuraX</span>
+        {mode && (
+          <div className="doc">
+            <span className="doc-name" title={mediaName}>{mediaName}</span>
+            {canvasDims.w > 0 && <span className="num hide-sm">{canvasDims.w} × {canvasDims.h}</span>}
+          </div>
+        )}
+        <div className="spacer" />
+        {activity && <span className="activity" role="status"><Spinner />{activity}</span>}
+        {mode && (
+          <div className="zoom" role="group" aria-label="Zoom">
+            <button type="button" onClick={() => zoomBy(0.8)} aria-label="Zoom out" title="Zoom out (Ctrl/⌘ + −)"><Minus aria-hidden="true" /></button>
+            <button type="button" className="pct" onClick={() => setZoom(1)} aria-label="Actual size" title="Actual size">{Math.round((zoom ?? shownScale) * 100)}%</button>
+            <button type="button" onClick={() => zoomBy(1.25)} aria-label="Zoom in" title="Zoom in (Ctrl/⌘ + =)"><Plus aria-hidden="true" /></button>
+            <button type="button" onClick={() => setZoom(null)} aria-pressed={zoom === null} aria-label="Fit to window" title="Fit to window (Ctrl/⌘ + 0)"><Maximize aria-hidden="true" /></button>
+          </div>
+        )}
+        <button type="button" className="btn" onClick={pickFiles}><ImagePlus aria-hidden="true" /><span className="hide-sm">Open</span></button>
+        <button type="button" className="btn primary" onClick={openExport} disabled={!mode || busy}>
+          {busy ? <Spinner /> : <Download aria-hidden="true" />}Export
+        </button>
+      </header>
+
+      {/* ── Workspace ── */}
+      <div className="stage-wrap">
+        <main ref={stageRef} className={`stage${zoom === null ? " fit" : ""}${dropActive ? " over" : ""}`} aria-label="Workspace" {...dropProps}>
+          {!mode ? (
+            <button type="button" className="drop lg" onClick={pickFiles}>
+              <Upload aria-hidden="true" />
+              <span className="t">Open images or a video</span>
+              <span className="sub">Drop files here, or click to choose. Up to {MAX_FILES} images, or one video. Files stay on this device.</span>
+            </button>
+          ) : (
+            <canvas ref={canvasRef} aria-label={`Preview of ${mediaName}`} data-tool={tool}
+              style={zoom === null ? undefined : { width: canvasDims.w * zoom }}
+              onMouseDown={onPtrDown} onMouseMove={onPtrMove} onMouseUp={onPtrUp} onMouseLeave={onPtrUp}
+              onTouchStart={e => { e.preventDefault(); onPtrDown(e); }}
+              onTouchMove={e => { e.preventDefault(); onPtrMove(e); }}
+              onTouchEnd={onPtrUp}
+            />
+          )}
+          {/* Outlines of blurred areas; editor-only, never drawn into the export. */}
+          {tool === "mask" && canvasBox && onScreen.length > 0 && (
+            <div className="mk-layer" style={canvasBox}>
+              {onScreen.map(m => {
+                const r = maskRect(m, maskStyle);
+                const cls = ["mk", maskStyle.shape === "ellipse" ? "oval" : "", m.off ? "off" : "", m.id === selectedMaskId ? "sel" : "", m.id === hoverMaskId ? "hov" : ""].join(" ");
+                return <div key={m.id} className={cls} style={{ left: `${r.x * 100}%`, top: `${r.y * 100}%`, width: `${r.w * 100}%`, height: `${r.h * 100}%` }} />;
+              })}
+              {selectedMask && selectedItem && (() => {
+                const r = maskRect(selectedMask, maskStyle);
+                const below = r.y < 0.14;
+                return (
+                  <div className={`mk-bar${below ? " below" : ""}`} style={{ left: `${(r.x + r.w / 2) * 100}%`, top: `${(below ? r.y + r.h : r.y) * 100}%` }}>
+                    <span className="mk-bar-name">{selectedItem.name}</span>
+                    {selectedItem.kind === "face" ? (
+                      <button type="button" className="btn sm" onClick={() => setAreaOff(selectedItem.id, !selectedItem.off)}>
+                        {selectedItem.off ? <><Eye aria-hidden="true" />Blur</> : <><EyeOff aria-hidden="true" />Don't blur</>}
+                      </button>
+                    ) : (
+                      <button type="button" className="btn sm danger" onClick={() => deleteArea(selectedItem.id)}><Trash2 aria-hidden="true" />Delete</button>
+                    )}
+                    <button type="button" className="icon-x" aria-label="Deselect" title="Deselect (Esc)" onClick={() => setSelectedMaskId(null)}><X aria-hidden="true" /></button>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+        </main>
+        {mode && !ready && <div className="stage-loading"><Spinner />Loading media…</div>}
+        {mode && ready && toolHint && showHint && <div className="tool-hint" aria-hidden="true">{toolHint}</div>}
+        {fileError && !exportOpen && (
+          <div className="notice err stage-notice" role="alert">
+            <span>{fileError}</span>
+            <button type="button" className="icon-x" aria-label="Dismiss" title="Dismiss" onClick={() => setFileError("")}><X aria-hidden="true" /></button>
+          </div>
+        )}
+      </div>
+
+      {/* ── Dock: filmstrip or video timeline ── */}
+      <footer className="dock" aria-label={mode === "video" ? "Timeline" : "Images"} hidden={!mode}>
+        {mode === "video" ? (
+          <div className="transport">
+            <button type="button" className="dl-btn" onClick={() => setVideoPaused(!videoPaused)} disabled={!videoReady} aria-label={videoPaused ? "Play" : "Pause"} title={videoPaused ? "Play" : "Pause"}>
+              {videoPaused ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}
+            </button>
+            <button type="button" className="dl-btn" onClick={() => setVideoMuted(!videoMuted)} aria-label={videoMuted ? "Turn sound on" : "Mute"} title={videoMuted ? "Turn sound on" : "Mute"}>
+              {videoMuted ? <VolumeX aria-hidden="true" /> : <Volume2 aria-hidden="true" />}
+            </button>
+            <input type="range" aria-label="Position in video" min={0} max={videoDur || 100} step={0.01} value={videoTime}
+              onChange={e => { const t = Number(e.target.value); if (vidElRef.current) vidElRef.current.currentTime = t; setVideoTime(t); }} />
+            <span className="time">{fmtTime(videoTime)} / {fmtTime(videoDur)}</span>
+          </div>
+        ) : (
+          <div className="strip" role="list">
+            {images.map((img, idx) => (
+              <div key={img.src} className="strip-item" role="listitem">
+                <button type="button" className="strip-pick" aria-current={selectedIdx === idx} aria-label={`Show ${img.file.name}`} title={img.file.name} onClick={() => setSelectedIdx(idx)}>
+                  <img src={img.src} alt="" />
+                </button>
+                <button type="button" className="strip-remove" aria-label={`Remove ${img.file.name}`} title="Remove" onClick={() => removeImage(idx)}>
+                  <X aria-hidden="true" />
+                </button>
+              </div>
+            ))}
+            {images.length < MAX_FILES && (
+              <button type="button" className="strip-add" onClick={pickFiles} aria-label="Add images" title={`Add images (${images.length} of ${MAX_FILES})`}>
+                <Plus aria-hidden="true" />
+              </button>
+            )}
+          </div>
+        )}
+        {faceStatus && (
+          <span className={`status${faceStatus.ok ? " good" : ""}`} role="status">
+            {faceStatus.spin ? <Spinner /> : <ScanFace aria-hidden="true" />}{faceStatus.text}
+          </span>
+        )}
+        {mode === "image" && <ArmedBtn className="sm" onConfirm={clearImages}>Remove all</ArmedBtn>}
+        {mode === "video" && <ArmedBtn className="sm" onConfirm={removeVideo}>Remove video</ArmedBtn>}
+      </footer>
+
+      {/* ── Properties for the active tool ── */}
+      <aside className="insp" aria-labelledby="insp-title">
+        {tool === "mask" && (
+          <>
+            <h2 id="insp-title">Face blur</h2>
+            <p className="insp-sub">Faces are found and covered on this device. Nothing is uploaded.</p>
+            <SwitchRow label="Find faces automatically" value={faceBlurOn} onChange={setFaceBlur} />
+            {faceBlurOn && modelError && (
+              <div className="notice err" role="alert">The face model couldn't be downloaded. Check the internet connection, then reload the page.</div>
+            )}
+
+            {mode && (
+              <div className="insp-sec">
+                <div className="sec-head">
+                  <h3>Blurred areas</h3>
+                  {areaItems.length > 0 && <span className="sec-meta num">{areaItems.filter(it => !it.off).length} of {areaItems.length} on</span>}
+                </div>
+                {areaItems.length === 0 ? (
+                  <p className="hint">
+                    {mode === "video" && faceBlurOn && trackStatus !== "ready" ? "Faces appear here after the video is scanned." : "Nothing is blurred yet. Drag on the image to blur an area."}
+                  </p>
+                ) : (
+                  <>
+                    <ul className="mk-list">
+                      {areaItems.map(it => (
+                        <li key={it.id} className={`mk-row${it.id === selectedMaskId ? " sel" : ""}${it.off ? " off" : ""}`}
+                          onMouseEnter={() => setHoverMaskId(it.id)} onMouseLeave={() => setHoverMaskId(h => (h === it.id ? null : h))}>
+                          <button type="button" className="mk-pick" aria-pressed={it.id === selectedMaskId} onClick={() => pickArea(it)} title="Show on the image">
+                            <span className="mk-thumb">{it.thumb ? <img src={it.thumb} alt="" /> : <SquareDashed aria-hidden="true" />}</span>
+                            <span className="mk-text">
+                              <span className="mk-name">{it.name}{it.off && <span className="badge neutral">Not blurred</span>}</span>
+                              <span className="mk-sub">{it.sub}</span>
+                            </span>
+                          </button>
+                          {it.kind === "face" ? (
+                            <button type="button" role="switch" className="switch sm" aria-checked={!it.off} aria-label={`Blur ${it.name}`} title={it.off ? "Blur this face" : "Don't blur this face"}
+                              onClick={() => setAreaOff(it.id, !it.off)} />
+                          ) : (
+                            <button type="button" className="icon-x" aria-label={`Delete ${it.name}`} title="Delete" onClick={() => deleteArea(it.id)}><Trash2 aria-hidden="true" /></button>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                    <p className="hint">Turn off faces that shouldn't be blurred. They stay off if faces are found again. Click a blur on the image to select it.</p>
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="insp-sec">
+              <h3>Effect</h3>
+              <Seg label="Mask effect" value={maskStyle.type} onChange={t => setMaskStyle(st => ({ ...st, type: t }))}
+                options={[{ value: "blur", label: "Blur" }, { value: "pixelate", label: "Pixelate" }, { value: "box", label: "Solid" }]} />
+              <Seg label="Mask shape" value={maskStyle.shape} onChange={sh => setMaskStyle(st => ({ ...st, shape: sh }))}
+                options={[{ value: "ellipse", label: "Oval" }, { value: "rect", label: "Rectangle" }]} />
+              {maskStyle.type === "box" ? (
+                <Field label="Colour">{colourSwatches(maskStyle.color, c => setMaskStyle(st => ({ ...st, color: c })), "Mask colour")}</Field>
+              ) : (
+                <Range label={maskStyle.type === "blur" ? "Blur strength" : "Block size"} value={maskStyle.strength} min={1} max={100} fmt={v => `${v}%`}
+                  onChange={v => setMaskStyle(st => ({ ...st, strength: v }))} />
+              )}
+              <Range label="Soft edge" value={maskStyle.feather} min={0} max={100} fmt={v => `${v}%`}
+                onChange={v => setMaskStyle(st => ({ ...st, feather: v }))} />
+            </div>
+
+            {faceBlurOn && (
+              <div className="insp-sec">
+                <h3>Detection</h3>
+                <Range label="Sensitivity" value={Math.round((1 - detectSettings.minConfidence) * 100)} min={10} max={90} fmt={v => `${v}%`}
+                  onChange={v => updateDetectSettings({ minConfidence: 1 - v / 100 })} />
+                <Range label="Extra cover around faces" value={maskStyle.padding} min={0} max={60} fmt={v => `${v}%`}
+                  onChange={v => setMaskStyle(st => ({ ...st, padding: v }))} />
+                <SwitchRow label="Find small faces" sub="Checks large photos in sections. Slower." value={detectSettings.smallFaceBoost}
+                  onChange={v => updateDetectSettings({ smallFaceBoost: v })} />
+                {mode === "image" && images.length > 1 && (
+                  unscannedCount === 0 ? (
+                    <div className="ok-line"><Check aria-hidden="true" />All {images.length} images checked for faces</div>
+                  ) : scan ? (
+                    <Progress label={scan.label} pct={scan.pct} />
+                  ) : (
+                    <>
+                      <p className="hint">{plural(unscannedCount, "image")} not checked yet. Export checks them first.</p>
+                      <button type="button" className="btn block" onClick={detectAllImages} disabled={!modelsLoaded}>
+                        <ScanFace aria-hidden="true" />Find faces in all images
+                      </button>
+                    </>
+                  )
+                )}
+              </div>
+            )}
+
+            {faceBlurOn && mode === "video" && (
+              <div className="insp-sec">
+                <h3>Face tracking</h3>
+                <Range label="Scan rate" value={detectSettings.scanFps} min={2} max={15} fmt={v => `${v} frames/s`}
+                  onChange={v => updateDetectSettings({ scanFps: v })} />
+                {trackStatus === "ready" && faceTrack.length > 0 ? (
+                  <div className="ok-line"><Check aria-hidden="true" />Following up to {plural(peakFaces, "face")} across {plural(faceTrack.length, "frame")}</div>
+                ) : (
+                  <p className="hint">
+                    {trackStatus === "idle" && "Scan the video so masks follow each face from frame to frame."}
+                    {trackStatus === "scanning" && "Playback pauses while the video is scanned."}
+                    {trackStatus === "stale" && "Settings changed. Rescan to update the masks. Export rescans if needed."}
+                    {trackStatus === "ready" && "Face track cleared."}
+                  </p>
+                )}
+                {trackStatus === "scanning" ? (
+                  <>
+                    {scan && <Progress label={scan.label} pct={scan.pct} />}
+                    <button type="button" className="btn block" onClick={cancelScan}>Cancel scan</button>
+                  </>
+                ) : (
+                  <button type="button" className="btn block" onClick={scanVideo} disabled={!modelsLoaded || !videoReady || exporting}>
+                    <ScanFace aria-hidden="true" />{trackStatus === "idle" ? "Scan video for faces" : "Rescan video"}
+                  </button>
+                )}
+              </div>
+            )}
+
+            {(masks.length > 0 || (mode === "video" && faceTrack.length > 0)) && (
+              <div className="insp-sec">
+                <ArmedBtn className="sm" onConfirm={clearAllMasks}>Clear all masks</ArmedBtn>
+              </div>
+            )}
+          </>
+        )}
+
+        {tool === "watermark" && (
+          <>
+            <h2 id="insp-title">Watermark</h2>
+            <p className="insp-sub">Drag on the image to place it.</p>
+            <Seg label="Watermark type" value={wmType} onChange={setWmType}
+              options={[{ value: WM.TEXT, label: "Text" }, { value: WM.IMG, label: "Image" }, { value: WM.LINK, label: "Link" }]} />
+            {wmType === WM.TEXT && <Field label="Text" htmlFor="wm-text"><TextInput id="wm-text" value={wmText} onChange={setWmText} placeholder="© Your brand" /></Field>}
+            {wmType === WM.LINK && <Field label="Link" htmlFor="wm-link"><TextInput id="wm-link" value={wmLink} onChange={setWmLink} placeholder="https://yourbrand.com" /></Field>}
+            {wmType === WM.IMG && (
+              <Field label="Logo">
+                <button type="button" className="btn block" onClick={() => document.getElementById("__wi")?.click()}>
+                  <Upload aria-hidden="true" />{wmImgFile ? wmImgFile.name : "Choose a logo (PNG)"}
+                </button>
+              </Field>
+            )}
+
+            {wmType !== WM.IMG && (
+              <div className="insp-sec">
+                <h3>Text style</h3>
+                <Field label="Colour">{colourSwatches(wmColor, setWmColor, "Watermark colour")}</Field>
+                <Field label="Font" htmlFor="wm-font"><Select id="wm-font" value={wmFont} onChange={setWmFont} options={FONTS} /></Field>
+                <SwitchRow label="Bold" value={wmBold} onChange={setWmBold} />
+              </div>
+            )}
+
+            <div className="insp-sec">
+              <h3>Size and placement</h3>
+              <Range label={wmType === WM.IMG ? "Logo width" : "Text size"} value={wmSize} min={8} max={120} fmt={v => wmType === WM.IMG ? `${v * 5} px` : `${v} px`} onChange={setWmSize} />
+              <Range label="Opacity" value={wmOpacity} min={5} max={100} fmt={v => `${v}%`} onChange={setWmOpacity} />
+              <div className="lbl">Position</div>
+              <div className="pos-grid" role="group" aria-label="Watermark position">
+                {PRESETS.map(p => {
+                  const { Icon, label } = POSITION_ICONS[p.id];
+                  return (
+                    <button key={p.id} type="button" className="btn sm" aria-pressed={activePreset === p.id} aria-label={label} title={label}
+                      onClick={() => { setActivePreset(p.id); setWmPos({ x: p.x, y: p.y }); }}>
+                      <Icon aria-hidden="true" />
+                    </button>
+                  );
+                })}
+              </div>
+              <SwitchRow label="Shadow" sub="Keeps it readable on light areas." value={wmShadow} onChange={setWmShadow} />
+            </div>
+          </>
+        )}
+
+        {tool === "adjust" && (
+          <>
+            <h2 id="insp-title">Adjust</h2>
+            <p className="insp-sub">A filter for the whole image. Applied before masks and the watermark.</p>
+            <div className="flt-grid" role="group" aria-label="Filter">
+              {FILTERS.map(f => (
+                <button key={f.value} type="button" className="flt" aria-pressed={wmFilter === f.value} onClick={() => setWmFilter(f.value)}>
+                  <span className="thumb">
+                    {filterThumb && <img src={filterThumb} alt="" style={{ filter: f.value === "blur" ? "blur(2px)" : f.value }} />}
+                  </span>
+                  {f.label}
+                </button>
+              ))}
+            </div>
+            {wmFilter === "blur" && <Range label="Blur radius" value={wmBlur} min={0} max={25} fmt={v => `${v} px`} onChange={setWmBlur} />}
+          </>
+        )}
       </aside>
 
-      <main>
-        <header className="top" ref={headerRef}>
-          <h1 id="title">{PANEL_TITLES[panel]}</h1>
-          <div className="actions">
-            {activity && <span className="activity" role="status"><Spinner />{activity}</span>}
-            <button type="button" className="btn primary" onClick={exportAction.run} disabled={!mode || exportAction.disabled}>
-              {exportAction.busy ? <Spinner /> : <Download aria-hidden="true" />}
-              {mode ? exportAction.label : "Export"}
+      {/* ── Export dialog ── */}
+      <Modal open={exportOpen} onClose={() => { if (!bulkProgress) setExportOpen(false); }} labelledBy="exp-title">
+        <h2 id="exp-title">Export</h2>
+        {mode === "image" && images.length > 1 && (
+          <Seg label="What to export" value={exportScope} onChange={setExportScope}
+            options={[{ value: "all", label: `All ${images.length} images` }, { value: "current", label: "This image" }]} />
+        )}
+        <div className="grid">
+          <div className="stat"><div className="k">{exportAll ? "Images" : "File"}</div><div className="v" title={mediaName}>{exportAll ? images.length : mediaName}</div></div>
+          <div className="stat"><div className="k">Saves as</div><div className="v">{mode === "video" ? "WebM video" : exportAll ? "ZIP of images" : activeImg?.file.type === "image/png" ? "PNG" : "JPG"}</div></div>
+        </div>
+        <Field label="File name prefix" htmlFor="exp-prefix"><TextInput id="exp-prefix" value={exportPrefix} onChange={setExportPrefix} placeholder="watermarked_" /></Field>
+        {faceBlurOn && exportAll && unscannedCount > 0 && <p className="hint">{plural(unscannedCount, "image")} {unscannedCount === 1 ? "hasn't" : "haven't"} been checked for faces yet. {unscannedCount === 1 ? "It's" : "They're"} checked before saving.</p>}
+        {faceBlurOn && mode === "video" && trackStatus !== "ready" && <p className="hint">The video is scanned for faces before recording.</p>}
+        {bulkProgress && <Progress label={exportMsg || "Exporting…"} meta={`${bulkProgress.done} of ${bulkProgress.total}`} pct={(bulkProgress.done / bulkProgress.total) * 100} />}
+        {fileError && <div className="notice err" role="alert">{fileError}</div>}
+        <div className="modal-foot">
+          <div>
+            <button type="button" className="btn sm" onClick={exportConfigJson} title="Save the watermark and mask settings to a file"><FileJson aria-hidden="true" />Save settings</button>
+            <button type="button" className="btn sm" onClick={() => document.getElementById("__ic")?.click()}><Upload aria-hidden="true" />Load settings</button>
+          </div>
+          <div>
+            <button type="button" className="btn" onClick={() => setExportOpen(false)} disabled={!!bulkProgress}>Cancel</button>
+            <button type="button" className="btn primary" onClick={runExport} disabled={busy || (mode === "video" ? !videoReady || trackStatus === "scanning" : !imgReady)}>
+              {bulkProgress ? <Spinner /> : <Download aria-hidden="true" />}
+              {bulkProgress ? "Exporting…" : mode === "video" ? "Export video" : exportAll ? `Export ${images.length} images` : "Export image"}
             </button>
           </div>
-        </header>
-
-        <div className="ws">
-          <div className="ws-preview">
-            <section className="card" aria-label="Preview">
-              {!mode ? renderDrop(true) : (
-                <>
-                  <div className="pv-meta">
-                    <span>{maskingMode ? "Drag on the preview to add a mask" : "Drag on the preview to move the watermark"}</span>
-                    {canvasDims.w > 0 && <span className="num">{canvasDims.w} × {canvasDims.h} px · {ratio}:1</span>}
-                  </div>
-                  <div className="pv-stage">
-                    <canvas ref={canvasRef} aria-label={`Preview of ${mediaName}`}
-                      onMouseDown={onPtrDown} onMouseMove={onPtrMove} onMouseUp={onPtrUp} onMouseLeave={onPtrUp}
-                      onTouchStart={e => { e.preventDefault(); onPtrDown(e); }}
-                      onTouchMove={e => { e.preventDefault(); onPtrMove(e); }}
-                      onTouchEnd={onPtrUp}
-                    />
-                    {!ready && <div className="pv-loading"><Spinner />Loading media…</div>}
-                  </div>
-
-                  {mode === "video" && videoReady && (
-                    <div className="pv-controls">
-                      <button type="button" className="dl-btn" onClick={() => setVideoPaused(!videoPaused)} aria-label={videoPaused ? "Play" : "Pause"} title={videoPaused ? "Play" : "Pause"}>
-                        {videoPaused ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}
-                      </button>
-                      <button type="button" className="dl-btn" onClick={() => setVideoMuted(!videoMuted)} aria-label={videoMuted ? "Turn sound on" : "Mute"} title={videoMuted ? "Turn sound on" : "Mute"}>
-                        {videoMuted ? <VolumeX aria-hidden="true" /> : <Volume2 aria-hidden="true" />}
-                      </button>
-                      <input type="range" aria-label="Position in video" min={0} max={videoDur || 100} step={0.01} value={videoTime}
-                        onChange={e => { const t = Number(e.target.value); if (vidElRef.current) vidElRef.current.currentTime = t; setVideoTime(t); }} />
-                      <span className="time">{fmtTime(videoTime)} / {fmtTime(videoDur)}</span>
-                    </div>
-                  )}
-
-                  {mode === "image" && images.length > 0 && (
-                    <div className="gl" role="list" aria-label="Images">
-                      {images.map((img, idx) => (
-                        <div key={img.src} className="gl-item" role="listitem">
-                          <button type="button" className="gl-pick" aria-current={selectedIdx === idx} aria-label={`Show ${img.file.name}`} title={img.file.name} onClick={() => setSelectedIdx(idx)}>
-                            <img src={img.src} alt="" />
-                          </button>
-                          <button type="button" className="gl-remove" aria-label={`Remove ${img.file.name}`} title="Remove" onClick={() => removeImage(idx)}>
-                            <X aria-hidden="true" />
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </>
-              )}
-            </section>
-          </div>
-
-          <div className="ws-side">
-            <section className="card hero" aria-live="polite">
-              <div className="what"><span className="chip-ico"><ScanFace aria-hidden="true" /></span>Faces masked</div>
-              <div className="big">{heroBig}{heroUnit && <small>{heroUnit}</small>}</div>
-              <div className="sub">{heroSub}</div>
-            </section>
-
-            {fileError && <div className="notice err" role="alert">{fileError}</div>}
-
-            {panel === "media" && (
-              <section className="card">
-                <h2>Media</h2>
-                {mode ? renderDrop(false) : <p className="hint">JPG, PNG, GIF, MP4 or WebM. Up to {MAX_FILES} images, or one video. Files stay on this device.</p>}
-                {mode && canvasDims.w > 0 && (
-                  <div className="grid">
-                    <div className="stat"><div className="k">Resolution</div><div className="v">{canvasDims.w} × {canvasDims.h}</div></div>
-                    <div className="stat"><div className="k">Aspect ratio</div><div className="v">{ratio}:1</div></div>
-                    {mode === "image"
-                      ? <div className="stat"><div className="k">Images</div><div className="v">{images.length} of {MAX_FILES}</div></div>
-                      : <div className="stat"><div className="k">Length</div><div className="v">{fmtTime(videoDur)}</div></div>}
-                    <div className="stat"><div className="k">File</div><div className="v" title={mediaName}>{mediaName}</div></div>
-                  </div>
-                )}
-                {mode === "image" && <ArmedBtn className="sm" onConfirm={clearImages}>Remove all images</ArmedBtn>}
-                {mode === "video" && <ArmedBtn className="sm" onConfirm={removeVideo}>Remove video</ArmedBtn>}
-              </section>
-            )}
-
-            {panel === "watermark" && (
-              <>
-                <section className="card">
-                  <h2>Watermark</h2>
-                  <Seg label="Watermark type" value={wmType} onChange={setWmType}
-                    options={[{ value: WM.TEXT, label: "Text" }, { value: WM.IMG, label: "Image" }, { value: WM.LINK, label: "Link" }]} />
-                  {wmType === WM.TEXT && <Field label="Text" htmlFor="wm-text"><TextInput id="wm-text" value={wmText} onChange={setWmText} placeholder="© Your brand" /></Field>}
-                  {wmType === WM.LINK && <Field label="Link" htmlFor="wm-link"><TextInput id="wm-link" value={wmLink} onChange={setWmLink} placeholder="https://yourbrand.com" /></Field>}
-                  {wmType === WM.IMG && (
-                    <Field label="Logo">
-                      <button type="button" className="btn block" onClick={() => document.getElementById("__wi")?.click()}>
-                        <Upload aria-hidden="true" />{wmImgFile ? wmImgFile.name : "Choose a logo (PNG)"}
-                      </button>
-                    </Field>
-                  )}
-                  {wmType !== WM.IMG && (
-                    <>
-                      <Field label="Colour">{colourSwatches(wmColor, setWmColor, "Watermark colour")}</Field>
-                      <Field label="Font" htmlFor="wm-font"><Select id="wm-font" value={wmFont} onChange={setWmFont} options={FONTS} /></Field>
-                      <SwitchRow label="Bold" value={wmBold} onChange={setWmBold} />
-                    </>
-                  )}
-                  <SwitchRow label="Shadow" sub="Keeps the watermark readable on light areas." value={wmShadow} onChange={setWmShadow} />
-                </section>
-
-                <section className="card">
-                  <h2>Size and position</h2>
-                  <Range label={wmType === WM.IMG ? "Logo width" : "Text size"} value={wmSize} min={8} max={120} fmt={v => wmType === WM.IMG ? `${v * 5} px` : `${v} px`} onChange={setWmSize} />
-                  <Range label="Opacity" value={wmOpacity} min={5} max={100} fmt={v => `${v}%`} onChange={setWmOpacity} />
-                  <div className="lbl">Position</div>
-                  <div className="pos-grid" role="group" aria-label="Watermark position">
-                    {PRESETS.map(p => {
-                      const { Icon, label } = POSITION_ICONS[p.id];
-                      return (
-                        <button key={p.id} type="button" className="btn sm" aria-pressed={activePreset === p.id} aria-label={label} title={label}
-                          onClick={() => { setActivePreset(p.id); setWmPos({ x: p.x, y: p.y }); }}>
-                          <Icon aria-hidden="true" />
-                        </button>
-                      );
-                    })}
-                  </div>
-                  <p className="hint">Or turn off face masking and drag on the preview.</p>
-                </section>
-
-                <section className="card">
-                  <h2>Image filter</h2>
-                  <Field label="Filter" htmlFor="wm-filter"><Select id="wm-filter" value={wmFilter} onChange={setWmFilter} options={FILTERS} /></Field>
-                  {wmFilter === "blur" && <Range label="Blur radius" value={wmBlur} min={0} max={25} fmt={v => `${v} px`} onChange={setWmBlur} />}
-                </section>
-              </>
-            )}
-
-            {panel === "masking" && (
-              <>
-                <section className="card">
-                  <h2>Masks</h2>
-                  <SwitchRow label="Face masking" value={maskingMode} onChange={setMaskingMode}
-                    sub={maskingMode ? "Drag on the preview to add your own masks." : "Off: dragging on the preview moves the watermark."} />
-                  {maskingMode && (
-                    <SwitchRow label="Find faces automatically" value={autoMaskEnabled} onChange={toggleAutoMask}
-                      sub="Runs on this device. Nothing is uploaded." />
-                  )}
-                  {maskingMode && autoMaskEnabled && modelError && (
-                    <div className="notice err" role="alert">The face model couldn't be downloaded. Check the internet connection, then reload the page.</div>
-                  )}
-                </section>
-
-                {maskingMode && autoMaskEnabled && (
-                  <section className="card">
-                    <h2>Detection</h2>
-                    <Range label="Sensitivity" value={Math.round((1 - detectSettings.minConfidence) * 100)} min={10} max={90} fmt={v => `${v}%`}
-                      onChange={v => updateDetectSettings({ minConfidence: 1 - v / 100 })} />
-                    <SwitchRow label="Find small faces" sub="Checks large photos in sections. Slower." value={detectSettings.smallFaceBoost}
-                      onChange={v => updateDetectSettings({ smallFaceBoost: v })} />
-                    {mode === "image" && images.length > 1 && (
-                      <div style={{ marginTop: 14 }}>
-                        {unscannedCount === 0 ? (
-                          <div className="ok-line"><Check aria-hidden="true" />All {images.length} images checked for faces</div>
-                        ) : scan ? (
-                          <Progress label={scan.label} pct={scan.pct} />
-                        ) : (
-                          <>
-                            <p className="hint">{plural(unscannedCount, "image")} not checked yet. Export checks them first.</p>
-                            <button type="button" className="btn block" onClick={detectAllImages} disabled={!modelsLoaded}>
-                              <ScanFace aria-hidden="true" />Find faces in all images
-                            </button>
-                          </>
-                        )}
-                      </div>
-                    )}
-                  </section>
-                )}
-
-                {maskingMode && autoMaskEnabled && mode === "video" && (
-                  <section className="card">
-                    <h2>Face tracking</h2>
-                    <Range label="Scan rate" value={detectSettings.scanFps} min={2} max={15} fmt={v => `${v} frames/s`}
-                      onChange={v => updateDetectSettings({ scanFps: v })} />
-                    {trackStatus === "ready" && faceTrack.length > 0 ? (
-                      <div className="ok-line"><Check aria-hidden="true" />Following up to {plural(peakFaces, "face")} across {plural(faceTrack.length, "frame")}</div>
-                    ) : (
-                      <p className="hint">
-                        {trackStatus === "idle" && "Scan the video so masks follow each face from frame to frame."}
-                        {trackStatus === "scanning" && "Playback pauses while the video is scanned."}
-                        {trackStatus === "stale" && "Settings changed. Rescan to update the masks. Export rescans if needed."}
-                        {trackStatus === "ready" && "Face track cleared."}
-                      </p>
-                    )}
-                    {trackStatus === "scanning" ? (
-                      <>
-                        {scan && <Progress label={scan.label} pct={scan.pct} />}
-                        <button type="button" className="btn block" onClick={cancelScan}>Cancel scan</button>
-                      </>
-                    ) : (
-                      <button type="button" className="btn block" onClick={scanVideo} disabled={!modelsLoaded || !videoReady || exporting}>
-                        <ScanFace aria-hidden="true" />{trackStatus === "idle" ? "Scan video for faces" : "Rescan video"}
-                      </button>
-                    )}
-                  </section>
-                )}
-
-                {maskingMode && (
-                  <section className="card">
-                    <h2>Mask style</h2>
-                    <div className="lbl">Effect</div>
-                    <Seg label="Mask effect" value={maskStyle.type} onChange={t => setMaskStyle(st => ({ ...st, type: t }))}
-                      options={[{ value: "blur", label: "Blur" }, { value: "pixelate", label: "Pixelate" }, { value: "box", label: "Solid" }]} />
-                    <div className="lbl">Shape</div>
-                    <Seg label="Mask shape" value={maskStyle.shape} onChange={sh => setMaskStyle(st => ({ ...st, shape: sh }))}
-                      options={[{ value: "ellipse", label: "Oval" }, { value: "rect", label: "Rectangle" }]} />
-                    {maskStyle.type === "box" ? (
-                      <Field label="Colour">{colourSwatches(maskStyle.color, c => setMaskStyle(st => ({ ...st, color: c })), "Mask colour")}</Field>
-                    ) : (
-                      <Range label={maskStyle.type === "blur" ? "Blur strength" : "Block size"} value={maskStyle.strength} min={1} max={100} fmt={v => `${v}%`}
-                        onChange={v => setMaskStyle(st => ({ ...st, strength: v }))} />
-                    )}
-                    <Range label="Soft edge" value={maskStyle.feather} min={0} max={100} fmt={v => `${v}%`}
-                      onChange={v => setMaskStyle(st => ({ ...st, feather: v }))} />
-                    {autoMaskEnabled && (
-                      <Range label="Extra cover around faces" value={maskStyle.padding} min={0} max={60} fmt={v => `${v}%`}
-                        onChange={v => setMaskStyle(st => ({ ...st, padding: v }))} />
-                    )}
-                    {(masks.length > 0 || (mode === "video" && faceTrack.length > 0)) && (
-                      <ArmedBtn className="sm" onConfirm={clearAllMasks}>Clear all masks</ArmedBtn>
-                    )}
-                  </section>
-                )}
-              </>
-            )}
-
-            {panel === "export" && (
-              <>
-                <section className="card">
-                  <h2>Export</h2>
-                  <Field label="File name prefix" htmlFor="exp-prefix"><TextInput id="exp-prefix" value={exportPrefix} onChange={setExportPrefix} placeholder="watermarked_" /></Field>
-                  {bulkProgress && <Progress label={exportMsg || "Exporting…"} meta={`${bulkProgress.done} of ${bulkProgress.total}`} pct={(bulkProgress.done / bulkProgress.total) * 100} />}
-                  {exporting && <Progress label="Recording video" meta={`${expPct}%`} pct={expPct} />}
-                  {mode === "image" && images.length > 1 && (
-                    <div className="btn-row">
-                      <button type="button" className="btn" onClick={exportSingleImage} disabled={!imgReady}><Download aria-hidden="true" />Export this image only</button>
-                    </div>
-                  )}
-                  <p className="hint">
-                    {!mode ? "Add media first. " : ""}
-                    PNG images stay PNG; other images save as JPG. Videos save as WebM.
-                  </p>
-                </section>
-                <section className="card">
-                  <h2>Settings file</h2>
-                  <p className="hint">Save the watermark and mask settings to use them again later.</p>
-                  <div className="btn-row">
-                    <button type="button" className="btn sm" onClick={exportConfigJson}><FileJson aria-hidden="true" />Save settings</button>
-                    <button type="button" className="btn sm" onClick={() => document.getElementById("__ic")?.click()}><Upload aria-hidden="true" />Load settings</button>
-                  </div>
-                </section>
-              </>
-            )}
-          </div>
         </div>
-      </main>
+      </Modal>
 
       <input id="__mi" type="file" accept="image/*,video/*" multiple hidden onChange={e => { if (e.target.files) ingestFiles(e.target.files); e.target.value = ""; }} />
       <input id="__wi" type="file" accept="image/*" hidden onChange={e => e.target.files?.[0] && setWmImgFile(e.target.files[0])} />

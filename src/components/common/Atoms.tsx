@@ -1,4 +1,4 @@
-import React, { FC, useEffect, useId, useState } from "react";
+import React, { FC, useEffect, useId, useRef, useState } from "react";
 
 // Shared controls. Styling lives in src/index.css; these only set classes and ARIA.
 
@@ -105,3 +105,38 @@ export const Progress: FC<{ label: string; meta?: string; pct: number }> = ({ la
     </div>
   </div>
 );
+
+/**
+ * Dialog over a dimmed backdrop. Closes on Escape, on the backdrop and via the
+ * caller's own Cancel button; moves focus in on open and back on close.
+ */
+export const Modal: FC<{ open: boolean; onClose: () => void; labelledBy: string; children: React.ReactNode }> = ({ open, onClose, labelledBy, children }) => {
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const closeRef = useRef(onClose);
+  useEffect(() => { closeRef.current = onClose; }, [onClose]);
+  useEffect(() => {
+    if (!open) return;
+    const opener = document.activeElement as HTMLElement | null;
+    const focusables = () => [...(cardRef.current?.querySelectorAll<HTMLElement>("button:not(:disabled), input, select, [tabindex]:not([tabindex='-1'])") ?? [])];
+    focusables()[0]?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); closeRef.current(); return; }
+      if (e.key !== "Tab") return;
+      const f = focusables();
+      if (!f.length) return;
+      const first = f[0], last = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("keydown", onKey); opener?.focus(); };
+  }, [open]);
+  if (!open) return null;
+  return (
+    <div className="modal" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div ref={cardRef} className="card modal-card" role="dialog" aria-modal="true" aria-labelledby={labelledBy}>
+        {children}
+      </div>
+    </div>
+  );
+};

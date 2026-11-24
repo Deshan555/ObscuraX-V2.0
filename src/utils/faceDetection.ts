@@ -76,7 +76,7 @@ export async function detectFaces(input: DetectInput, opts: DetectOptions): Prom
   return mergeOverlapping(boxes);
 }
 
-function overlap(a: FaceBox, b: FaceBox) {
+export function overlap(a: Pick<FaceBox, "x" | "y" | "w" | "h">, b: Pick<FaceBox, "x" | "y" | "w" | "h">) {
   const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y);
   const x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
   if (x1 >= x2 || y1 >= y2) return { iou: 0, contain: 0 };
@@ -103,8 +103,24 @@ function mergeOverlapping(boxes: FaceBox[]): FaceBox[] {
 }
 
 let idSeq = 0;
+/** Video boxes keep their track id (`track-<id>`) so a face is the same item in every frame. */
 export function facesToMasks(boxes: FaceBox[]): Mask[] {
-  return boxes.map(b => ({ id: `auto-${++idSeq}`, x: b.x, y: b.y, w: b.w, h: b.h, type: "blur", isAuto: true }));
+  return boxes.map(b => ({
+    id: b.id != null ? `track-${b.id}` : `auto-${++idSeq}`,
+    x: b.x, y: b.y, w: b.w, h: b.h, type: "blur", isAuto: true, score: b.score,
+  }));
+}
+
+/** Square JPEG thumbnail of a face, with some margin, from the unmasked source. */
+export function cropThumb(source: HTMLImageElement | HTMLVideoElement, box: Pick<FaceBox, "x" | "y" | "w" | "h">, size = 72): string {
+  const W = source instanceof HTMLVideoElement ? source.videoWidth : source.naturalWidth;
+  const H = source instanceof HTMLVideoElement ? source.videoHeight : source.naturalHeight;
+  const side = Math.max(box.w * W, box.h * H) * 1.35;
+  const cx = (box.x + box.w / 2) * W, cy = (box.y + box.h / 2) * H;
+  const c = document.createElement("canvas");
+  c.width = c.height = size;
+  c.getContext("2d")!.drawImage(source, cx - side / 2, cy - side / 2, side, side, 0, 0, size, size);
+  return c.toDataURL("image/jpeg", 0.8);
 }
 
 // ── Video tracking ────────────────────────────────────────────────────────────
@@ -115,12 +131,14 @@ const center = (b: FaceBox) => ({ cx: b.x + b.w / 2, cy: b.y + b.h / 2 });
  * Pairs faces between two neighbouring samples, closest first. Two boxes match
  * when their centres are within one face-width of each other.
  */
-function matchBoxes(a: FaceBox[], b: FaceBox[]) {
+function matchBoxes(a: FaceBox[], b: FaceBox[], reach = 1) {
   const pairs: { i: number; j: number; d: number }[] = [];
   a.forEach((ba, i) => b.forEach((bb, j) => {
     const ca = center(ba), cb = center(bb);
     const d = Math.hypot(ca.cx - cb.cx, ca.cy - cb.cy);
-    if (d < Math.max(ba.w, ba.h, bb.w, bb.h)) pairs.push({ i, j, d });
+    // Linked boxes match only their own track; otherwise match by distance.
+    const ok = ba.id != null && bb.id != null ? ba.id === bb.id : d < Math.max(ba.w, ba.h, bb.w, bb.h) * reach;
+    if (ok) pairs.push({ i, j, d });
   }));
   pairs.sort((p, q) => p.d - q.d);
   const usedA = new Set<number>(), usedB = new Set<number>();
@@ -160,11 +178,39 @@ export function boxesAt(track: TrackSample[], t: number): FaceBox[] {
   const { matched, onlyA, onlyB } = matchBoxes(A.boxes, B.boxes);
   return [
     ...matched.map(([a, b]) => ({
-      x: lerp(a.x, b.x, k), y: lerp(a.y, b.y, k), w: lerp(a.w, b.w, k), h: lerp(a.h, b.h, k), score: Math.max(a.score, b.score),
+      x: lerp(a.x, b.x, k), y: lerp(a.y, b.y, k), w: lerp(a.w, b.w, k), h: lerp(a.h, b.h, k), score: Math.max(a.score, b.score), id: a.id,
     })),
     ...onlyA,
     ...onlyB,
   ];
+}
+
+/**
+ * Links detections into tracks while a video is scanned: a box near a face
+ * seen in the last `maxGap` seconds gets that face's id, otherwise a new one.
+ */
+export function createTrackLinker(maxGap = 1) {
+  let next = 1;
+  const live: { id: number; box: FaceBox; t: number }[] = [];
+  return (t: number, boxes: FaceBox[]): { boxes: FaceBox[]; newIds: number[] } => {
+    const recent = live.filter(tr => t - tr.t <= maxGap);
+    const prevBoxes: FaceBox[] = recent.map(tr => ({ ...tr.box, id: undefined }));
+    const { matched, onlyB } = matchBoxes(prevBoxes, boxes, 1.5);
+    const newIds: number[] = [];
+    const out: FaceBox[] = [];
+    for (const [prev, cur] of matched) {
+      const tr = recent[prevBoxes.indexOf(prev)];
+      tr.box = cur; tr.t = t;
+      out.push({ ...cur, id: tr.id });
+    }
+    for (const cur of onlyB) {
+      const id = next++;
+      live.push({ id, box: cur, t });
+      newIds.push(id);
+      out.push({ ...cur, id });
+    }
+    return { boxes: out, newIds };
+  };
 }
 
 /** Seeks a video and resolves once the new frame is available. */

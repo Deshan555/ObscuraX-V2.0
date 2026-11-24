@@ -72,7 +72,8 @@ function shapePath(x: CanvasRenderingContext2D, shape: MaskStyle["shape"], px: n
 
 const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 
-function renderMask(ctx: CanvasRenderingContext2D, W: number, H: number, m: Mask, style: MaskStyle) {
+/** The area a mask actually covers (normalised), including face padding. */
+export function maskRect(m: Mask, style: MaskStyle) {
   let { x, y, w, h } = m;
   if (w < 0) { x += w; w = -w; }
   if (h < 0) { y += h; h = -h; }
@@ -82,6 +83,11 @@ function renderMask(ctx: CanvasRenderingContext2D, W: number, H: number, m: Mask
     x -= w * p; w *= 1 + 2 * p;
     y -= h * p * 1.4; h *= 1 + 2 * p;
   }
+  return { x, y, w, h };
+}
+
+function renderMask(ctx: CanvasRenderingContext2D, W: number, H: number, m: Mask, style: MaskStyle) {
+  const { x, y, w, h } = maskRect(m, style);
   const bx = x * W, by = y * H, bw = w * W, bh = h * H;
   const minSide = Math.min(bw, bh);
   if (minSide < 1) return;
@@ -161,5 +167,5 @@ function renderMask(ctx: CanvasRenderingContext2D, W: number, H: number, m: Mask
 }
 
 export function applyMasks(ctx: CanvasRenderingContext2D, W: number, H: number, masks: Mask[], style: MaskStyle = DEFAULT_MASK_STYLE) {
-  for (const m of masks) renderMask(ctx, W, H, m, style);
+  for (const m of masks) if (!m.off) renderMask(ctx, W, H, m, style);
 }

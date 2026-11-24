@@ -39,6 +39,10 @@ export interface Mask {
   h: number;
   type: MaskType;
   isAuto?: boolean;
+  /** Kept in the list but not blurred (the user turned it off). */
+  off?: boolean;
+  /** Detector confidence, 0–1, for auto-detected faces. */
+  score?: number;
   /** @deprecated style now comes from MaskStyle; kept for older callers. */
   blurLevel?: number;
 }
@@ -75,6 +79,20 @@ export interface FaceBox {
   w: number;
   h: number;
   score: number;
+  /** Video only: the same person across samples shares an id. */
+  id?: number;
+}
+
+/** Video only: one person followed through the video. */
+export interface TrackInfo {
+  id: number;
+  thumb: string;
+  score: number;
+  /** Samples the face appears in. */
+  samples: number;
+  /** Where and when the face was first seen, to re-identify it after a rescan. */
+  firstT: number;
+  firstBox: FaceBox;
 }
 
 export interface TrackSample {
