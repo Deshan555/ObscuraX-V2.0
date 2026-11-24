@@ -94,3 +94,27 @@ export const WmTab: FC<{ id: string; label: string; active: boolean; onSelect: (
     {label}
   </button>
 );
+
+interface SegProps<T extends string> {
+  options: { value: T; label: string }[];
+  value: T;
+  onChange: (v: T) => void;
+  accent?: string;
+  mb?: number;
+}
+
+/** Row of mutually exclusive buttons. */
+export function Seg<T extends string>({ options, value, onChange, accent = C.gold, mb = 12 }: SegProps<T>) {
+  return (
+    <div style={{ display: "flex", gap: 5, marginBottom: mb }}>
+      {options.map(o => {
+        const on = o.value === value;
+        return (
+          <button key={o.value} onClick={() => onChange(o.value)} style={{ flex: 1, padding: "6px 0", background: on ? accent : C.card, border: `1px solid ${on ? accent : C.border}`, borderRadius: 5, color: on ? C.bg : C.muted, fontFamily: "'JetBrains Mono',monospace", fontSize: 9, letterSpacing: 1, cursor: "pointer", fontWeight: on ? 700 : 400 }}>
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}

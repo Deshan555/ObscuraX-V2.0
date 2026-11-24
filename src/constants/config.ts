@@ -1,3 +1,5 @@
+import { DetectSettings, MaskStyle } from "../types";
+
 export const WM = { TEXT: "text", IMG: "img", LINK: "link" } as const;
 
 export const PRESETS = [
@@ -33,3 +35,18 @@ export const FILTERS = [
   { label: "Contrast",  value: "contrast(1.6)" },
   { label: "Vintage",   value: "sepia(50%) contrast(1.2) brightness(0.9)" },
 ];
+
+export const DEFAULT_MASK_STYLE: MaskStyle = {
+  type: "blur",
+  strength: 60,
+  shape: "ellipse",
+  feather: 25,
+  color: "#000000",
+  padding: 20,
+};
+
+export const DEFAULT_DETECT_SETTINGS: DetectSettings = {
+  minConfidence: 0.4,
+  smallFaceBoost: true,
+  scanFps: 5,
+};

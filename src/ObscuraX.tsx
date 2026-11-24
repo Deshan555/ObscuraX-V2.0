@@ -1,13 +1,24 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import JSZip from "jszip/dist/jszip.min.js";
-import * as faceapi from "face-api.js";
 
-import { ImageEntry, BulkProgress, WatermarkConfig, Mask } from "./types";
+import { ImageEntry, BulkProgress, WatermarkConfig, Mask, MaskStyle, DetectSettings, TrackSample } from "./types";
 import { C } from "./constants/theme";
-import { WM, PRESETS, FONTS, PALETTE, MAX_FILES, FILTERS } from "./constants/config";
+import { WM, PRESETS, FONTS, PALETTE, MAX_FILES, FILTERS, DEFAULT_MASK_STYLE, DEFAULT_DETECT_SETTINGS } from "./constants/config";
 import { applyWatermark, applyMasks } from "./utils/canvas";
+import { loadFaceModels, detectFaces, facesToMasks, boxesAt, seekVideo } from "./utils/faceDetection";
 import { detectImageResolution } from "./helpers/media";
-import { Sect, FL, TI, Toggle, Slider, Btn, WmTab } from "./components/common/Atoms";
+import { Sect, FL, TI, Toggle, Slider, Btn, WmTab, Seg } from "./components/common/Atoms";
+
+const loadImage = (src: string) => new Promise<HTMLImageElement>((resolve, reject) => {
+  const el = new Image();
+  el.onload = () => resolve(el);
+  el.onerror = reject;
+  el.src = src;
+});
+
+const MODEL_MISSING_MSG = "Face detection model isn't loaded. Wait for it, or turn off Auto-Mask Faces, before exporting.";
+
+type TrackStatus = "idle" | "scanning" | "ready" | "stale";
 
 export default function ObscuraX() {
   const [images, setImages] = useState<ImageEntry[]>([]);
@@ -41,15 +52,21 @@ export default function ObscuraX() {
   const [wmBlur, setWmBlur] = useState(4);
   const [exportPrefix, setExportPrefix] = useState("watermarked_");
 
+  // Image mode: mirror of the selected image's masks. Video mode: manual masks only
+  // (auto face masks come from faceTrack, per frame).
   const [masks, setMasks] = useState<Mask[]>([]);
-  const [maskBlur, setMaskBlur] = useState(12);
+  const [maskStyle, setMaskStyle] = useState<MaskStyle>(DEFAULT_MASK_STYLE);
+  const [detectSettings, setDetectSettings] = useState<DetectSettings>(DEFAULT_DETECT_SETTINGS);
   const [maskingMode, setMaskingMode] = useState(false);
   const [activePreset, setActivePreset] = useState<string | null>("bc");
-  const [selMaskIdx, setSelMaskIdx] = useState<number | null>(null);
   const [modelsLoaded, setModelsLoaded] = useState(false);
+  const [modelError, setModelError] = useState(false);
   const [autoMaskEnabled, setAutoMaskEnabled] = useState(true);
-  const [maskType, setMaskType] = useState<Mask["type"]>("blur");
-  const [vidCaptureScope, setVidCaptureScope] = useState<"frame" | "entire">("frame");
+  const [faceTrack, setFaceTrack] = useState<TrackSample[]>([]);
+  const [trackStatus, setTrackStatus] = useState<TrackStatus>("idle");
+  const [scan, setScan] = useState<{ label: string; pct: number } | null>(null);
+  const scanToken = useRef(0);
+  const drawingId = useRef<string | null>(null);
 
   const [exporting, setExporting] = useState(false);
   const [exportMsg, setExportMsg] = useState("");
@@ -67,22 +84,9 @@ export default function ObscuraX() {
   const [canvasDims, setCanvasDims] = useState({ w: 0, h: 0 });
 
   useEffect(() => {
-    (async () => {
-      try {
-        await Promise.all([
-          faceapi.nets.ssdMobilenetv1.loadFromUri(
-            "https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights"
-          ),
-          faceapi.nets.tinyFaceDetector.loadFromUri(
-            "https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights"
-          )
-        ]);
-        console.log("ObscuraX: Models loaded successfully");
-        setModelsLoaded(true);
-      } catch (err) {
-        console.error("ObscuraX: Failed to load models:", err);
-      }
-    })();
+    loadFaceModels()
+      .then(() => setModelsLoaded(true))
+      .catch(err => { console.error("ObscuraX: Failed to load face model:", err); setModelError(true); });
   }, []);
 
   useEffect(() => {
@@ -109,6 +113,9 @@ export default function ObscuraX() {
     if (!videoFile) return;
     const url = URL.createObjectURL(videoFile);
     setVideoSrc(url); setVideoReady(false); setExported(false);
+    // New video: drop the previous video's masks and face track, cancel any scan.
+    scanToken.current++;
+    setMasks([]); setFaceTrack([]); setTrackStatus("idle"); setScan(null);
     return () => URL.revokeObjectURL(url);
   }, [videoFile]);
 
@@ -134,11 +141,20 @@ export default function ObscuraX() {
     ctx.filter = filter;
     ctx.drawImage(med, 0, 0, cvs.width, cvs.height);
     ctx.filter = "none";
-    applyMasks(ctx, cvs.width, cvs.height, masks);
+    let active = masks;
+    if (mode === "video" && autoMaskEnabled && faceTrack.length) {
+      active = [...facesToMasks(boxesAt(faceTrack, (med as HTMLVideoElement).currentTime)), ...masks];
+    }
+    applyMasks(ctx, cvs.width, cvs.height, active, maskStyle);
     applyWatermark(ctx, cvs.width, cvs.height, cfg);
-  }, [mode, imgReady, videoReady, wmConfig, masks]);
+  }, [mode, imgReady, videoReady, wmConfig, masks, autoMaskEnabled, faceTrack, maskStyle]);
+
+  const drawRef = useRef(draw);
+  useEffect(() => { drawRef.current = draw; }, [draw]);
 
   useEffect(() => { if (mode === "image" && imgReady) draw(); }, [draw, mode, imgReady]);
+  // A paused video has no render loop; redraw when settings or masks change.
+  useEffect(() => { if (mode === "video" && videoReady && videoPaused) draw(); }, [draw, mode, videoReady, videoPaused]);
 
   useEffect(() => {
     if (mode !== "video" || !videoReady || videoPaused) return;
@@ -157,91 +173,129 @@ export default function ObscuraX() {
     if (videoPaused) vid.pause(); else vid.play();
   }, [videoPaused]);
 
-  const autoDetectFaces = useCallback(async (opts: { append?: boolean } = {}) => {
-    if (!modelsLoaded || !mode) return;
-    let input: HTMLImageElement | HTMLVideoElement | null = null;
-    let inputW = 0, inputH = 0;
-    if (mode === "image" && images.length > 0) {
-      const entry = images[selectedIdx];
-      if (!entry) return;
-      const img = new Image();
-      img.src = entry.src;
-      await new Promise(r => (img.onload = r));
-      input = img; inputW = img.naturalWidth; inputH = img.naturalHeight;
-    } else if (mode === "video" && vidElRef.current) {
-      input = vidElRef.current; inputW = input.videoWidth; inputH = input.videoHeight;
+  // ── Face detection ──────────────────────────────────────────────────────────
+  const { minConfidence, smallFaceBoost } = detectSettings;
+  const detectOpts = useMemo(() => ({ minConfidence, smallFaceBoost }), [minConfidence, smallFaceBoost]);
+
+  /** Applies a mask change to the selected image (image mode) or the video's manual masks. */
+  const updateMasks = useCallback((fn: (prev: Mask[]) => Mask[]) => {
+    if (mode === "image") setImages(prev => prev.map((img, i) => i === selectedIdx ? { ...img, masks: fn(img.masks) } : img));
+    else setMasks(fn);
+  }, [mode, selectedIdx]);
+
+  /** Replaces auto masks on an image. Keyed by src because indices can shift while detection runs. */
+  const setAutoMasks = useCallback((src: string, autos: Mask[]) => {
+    setImages(prev => prev.map(img => img.src === src
+      ? { ...img, scanned: true, masks: [...autos, ...img.masks.filter(m => !m.isAuto)] }
+      : img));
+  }, []);
+
+  const updateDetectSettings = useCallback((patch: Partial<DetectSettings>) => {
+    setDetectSettings(prev => ({ ...prev, ...patch }));
+    // Images re-detect lazily (on view or export); video waits for an explicit rescan.
+    if ("minConfidence" in patch || "smallFaceBoost" in patch) setImages(prev => prev.map(img => ({ ...img, scanned: false })));
+    setTrackStatus(s => (s === "ready" ? "stale" : s));
+  }, []);
+
+  // Detect faces on the selected image whenever it hasn't been scanned with the current settings.
+  const activeSrc = mode === "image" ? images[selectedIdx]?.src : undefined;
+  const activeScanned = mode === "image" && !!images[selectedIdx]?.scanned;
+  useEffect(() => {
+    if (!modelsLoaded || !maskingMode || !autoMaskEnabled || !activeSrc || activeScanned) return;
+    let cancelled = false;
+    // Debounced so dragging the sensitivity slider doesn't queue a detection per tick.
+    const timer = setTimeout(async () => {
+      try {
+        const boxes = await detectFaces(await loadImage(activeSrc), detectOpts);
+        if (!cancelled) setAutoMasks(activeSrc, facesToMasks(boxes));
+      } catch (err) {
+        console.error("ObscuraX: Detection error:", err);
+      }
+    }, 250);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [modelsLoaded, maskingMode, autoMaskEnabled, activeSrc, activeScanned, detectOpts, setAutoMasks]);
+
+  const unscannedCount = images.filter(img => !img.scanned).length;
+
+  const detectAllImages = useCallback(async () => {
+    if (!modelsLoaded) return;
+    const todo = images.filter(img => !img.scanned);
+    for (let i = 0; i < todo.length; i++) {
+      setScan({ label: `Detecting faces ${i + 1}/${todo.length}…`, pct: Math.round((i / todo.length) * 100) });
+      try {
+        const boxes = await detectFaces(await loadImage(todo[i].src), detectOpts);
+        setAutoMasks(todo[i].src, facesToMasks(boxes));
+      } catch (err) {
+        console.error("ObscuraX: Detection error:", err);
+      }
     }
-    if (!input || !inputW || !inputH) return;
-    console.log("ObscuraX: Starting auto-detection...");
+    setScan(null);
+  }, [modelsLoaded, images, detectOpts, setAutoMasks]);
+
+  // ── Video face tracking ─────────────────────────────────────────────────────
+  /**
+   * Samples the video at `scanFps`, detects faces in each sample, and stores the
+   * result as a track. Rendering interpolates between samples so masks follow
+   * moving faces. Resolves false if cancelled or failed.
+   */
+  const scanVideo = useCallback(async (): Promise<boolean> => {
+    const vid = vidElRef.current;
+    if (!modelsLoaded || !vid || !Number.isFinite(vid.duration) || vid.duration <= 0) return false;
+    const token = ++scanToken.current;
+    const wasPlaying = !vid.paused;
+    const t0 = vid.currentTime;
+    vid.pause(); setVideoPaused(true);
+    setTrackStatus("scanning");
+    const fps = detectSettings.scanFps;
+    const lastT = Math.max(0, vid.duration - 0.05);
+    const n = Math.max(2, Math.ceil(lastT * fps) + 1);
+    const samples: TrackSample[] = [];
     try {
-      // Lower minConfidence for videos to 0.2 for maximum capture
-      const detections = await faceapi.detectAllFaces(input, new faceapi.SsdMobilenetv1Options({ minConfidence: mode === "video" ? 0.2 : 0.4 }));
-      console.log(`ObscuraX: Detected ${detections.length} faces`);
-      if (detections.length > 0) {
-        console.log(`ObscuraX: Detected ${detections.length} faces`);
-        const newMasks: Mask[] = detections.map(d => ({
-          id: Math.random().toString(36).substr(2, 9),
-          x: d.box.x / inputW, y: d.box.y / inputH,
-          w: d.box.width / inputW, h: d.box.height / inputH,
-          type: maskType, isAuto: true,
-          blurLevel: maskType === "blur" ? maskBlur : undefined,
-        }));
-        if (mode === "image") {
-          setImages(prev => prev.map((img, i) => {
-            if (i !== selectedIdx) return img;
-            const base = opts.append ? img.masks : img.masks.filter(m => !m.isAuto);
-            const filtered = newMasks.filter(nm => !base.some(bm => {
-              const x1=Math.max(nm.x,bm.x), y1=Math.max(nm.y,bm.y), x2=Math.min(nm.x+nm.w,bm.x+bm.w), y2=Math.min(nm.y+nm.h,bm.y+bm.h);
-              if (x1>=x2 || y1>=y2) return false;
-              const inter=(x2-x1)*(y2-y1), a1=nm.w*nm.h, a2=bm.w*bm.h;
-              return inter/Math.min(a1,a2) > 0.7;
-            }));
-            return { ...img, masks: [...base, ...filtered] };
-          }));
-        } else {
-          setMasks(prev => {
-            const base = opts.append ? prev : prev.filter(m => !m.isAuto);
-            // Deduplicate: don't add if 70% overlap with existing
-            const filtered = newMasks.filter(nm => !base.some(bm => {
-              const x1=Math.max(nm.x,bm.x), y1=Math.max(nm.y,bm.y), x2=Math.min(nm.x+nm.w,bm.x+bm.w), y2=Math.min(nm.y+nm.h,bm.y+bm.h);
-              if (x1>=x2 || y1>=y2) return false;
-              const inter=(x2-x1)*(y2-y1), a1=nm.w*nm.h, a2=bm.w*bm.h;
-              return inter/Math.min(a1,a2) > 0.7;
-            }));
-            return [...base, ...filtered];
-          });
-        }
+      for (let i = 0; i < n; i++) {
+        if (token !== scanToken.current) return false;
+        const t = Math.min(i / fps, lastT);
+        if (samples.length && t <= samples[samples.length - 1].t) continue;
+        await seekVideo(vid, t);
+        if (token !== scanToken.current) return false;
+        samples.push({ t, boxes: await detectFaces(vid, detectOpts) });
+        setScan({ label: `Tracking faces… ${i + 1}/${n}`, pct: Math.round(((i + 1) / n) * 100) });
       }
     } catch (err) {
-      console.error("ObscuraX: Detection error:", err);
+      console.error("ObscuraX: Video scan failed:", err);
+      if (token === scanToken.current) { setTrackStatus("stale"); setScan(null); }
+      return false;
     }
-  }, [modelsLoaded, mode, images, selectedIdx, maskType]);
+    if (token !== scanToken.current) return false;
+    setFaceTrack(samples); setTrackStatus("ready"); setScan(null);
+    await seekVideo(vid, t0);
+    if (wasPlaying) setVideoPaused(false);
+    return true;
+  }, [modelsLoaded, detectSettings.scanFps, detectOpts]);
 
-  const scanVideo = useCallback(async () => {
-    if (!modelsLoaded || mode !== "video" || !vidElRef.current) return;
-    const vid = vidElRef.current;
-    const originalTime = vid.currentTime;
-    const steps = 15; // Increased steps for better detection coverage
-    setExporting(true); setExportMsg("Scanning entire video for faces...");
-    for (let i = 0; i < steps; i++) {
-      vid.currentTime = (i / (steps - 1)) * vid.duration;
-      await new Promise(r => (vid.onseeked = r));
-      await autoDetectFaces({ append: true });
-      setExpPct(Math.round((i / (steps - 1)) * 100));
-    }
-    vid.currentTime = originalTime;
-    setExporting(false); setExportMsg(""); setExpPct(0);
-  }, [modelsLoaded, mode, autoDetectFaces]);
+  const cancelScan = () => {
+    scanToken.current++;
+    setScan(null);
+    setTrackStatus("stale");
+  };
 
   useEffect(() => {
-    if (modelsLoaded && maskingMode && autoMaskEnabled) {
-      if (mode === "image" && imgReady) autoDetectFaces();
-      else if (mode === "video" && videoReady) {
-        if (vidCaptureScope === "entire") scanVideo();
-        else autoDetectFaces();
-      }
+    if (mode === "video" && videoReady && modelsLoaded && maskingMode && autoMaskEnabled && trackStatus === "idle") scanVideo();
+  }, [mode, videoReady, modelsLoaded, maskingMode, autoMaskEnabled, trackStatus, scanVideo]);
+
+  const toggleAutoMask = (val: boolean) => {
+    setAutoMaskEnabled(val);
+    if (!val) {
+      // Off means no auto masks anywhere, including images not currently shown.
+      setImages(prev => prev.map(img => ({ ...img, scanned: false, masks: img.masks.filter(m => !m.isAuto) })));
+    } else if (mode === "video" && !faceTrack.length) {
+      setTrackStatus("idle");
     }
-  }, [modelsLoaded, mode, imgReady, videoReady, autoDetectFaces, selectedIdx, maskingMode, autoMaskEnabled, vidCaptureScope, scanVideo]);
+  };
+
+  const clearAllMasks = () => {
+    if (mode === "image") updateMasks(() => []);
+    else { scanToken.current++; setScan(null); setMasks([]); setFaceTrack([]); setTrackStatus("ready"); }
+  };
 
   const onImgLoad = useCallback((el: HTMLImageElement) => {
     if (!el || !canvasRef.current) return;
@@ -305,13 +359,9 @@ export default function ObscuraX() {
     const pos = posFromEvent(e);
     if (maskingMode) {
       maskStart.current = pos;
-      const newMask: Mask = { id: Date.now().toString(), ...pos, w: 0, h: 0, type: maskType, isAuto: false, blurLevel: maskType === "blur" ? maskBlur : undefined };
-      if (mode === "image") {
-        setImages(prev => prev.map((img, i) => i === selectedIdx ? { ...img, masks: [...img.masks, newMask] } : img));
-      } else {
-        setMasks(prev => [...prev, newMask]);
-      }
-      setSelMaskIdx(masks.length);
+      const id = `m-${Date.now()}`;
+      drawingId.current = id;
+      updateMasks(prev => [...prev, { id, ...pos, w: 0, h: 0, type: maskStyle.type, isAuto: false }]);
     } else { setActivePreset(null); setWmPos(pos); }
   };
 
@@ -319,59 +369,27 @@ export default function ObscuraX() {
     if (!dragging.current) return;
     e.preventDefault();
     const pos = posFromEvent(e);
-    if (maskingMode && maskStart.current) {
-      if (mode === "image") {
-        setImages(prev => prev.map((img, i) => {
-          if (i !== selectedIdx) return img;
-          const nextMasks = [...img.masks];
-          const curr = nextMasks[nextMasks.length - 1];
-          if (!curr) return img;
-          curr.w = pos.x - maskStart.current!.x;
-          curr.h = pos.y - maskStart.current!.y;
-          return { ...img, masks: nextMasks };
-        }));
-      } else {
-        setMasks(prev => {
-          const next = [...prev];
-          const curr = next[next.length - 1];
-          if (!curr) return prev;
-          curr.w = pos.x - maskStart.current!.x;
-          curr.h = pos.y - maskStart.current!.y;
-          return next;
-        });
-      }
-    } else { setWmPos(pos); }
+    const start = maskStart.current, id = drawingId.current;
+    if (maskingMode && start && id) {
+      updateMasks(prev => prev.map(m => m.id === id ? { ...m, w: pos.x - start.x, h: pos.y - start.y } : m));
+    } else if (!maskingMode) { setWmPos(pos); }
   };
 
   const onPtrUp = () => {
-    dragging.current = false; maskStart.current = null;
-    if (maskingMode) {
-      if (mode === "image") {
-        setImages(prev => prev.map((img, i) => {
-          if (i !== selectedIdx) return img;
-          if (!img.masks.length) return img;
-          const nextMasks = [...img.masks];
-          const last = nextMasks[nextMasks.length - 1];
-          if (last.w < 0) { last.x += last.w; last.w = Math.abs(last.w); }
-          if (last.h < 0) { last.y += last.h; last.h = Math.abs(last.h); }
-          if (Math.abs(last.w) < 0.005 && Math.abs(last.h) < 0.005) return { ...img, masks: nextMasks.slice(0, -1) };
-          return { ...img, masks: nextMasks };
-        }));
-      } else {
-        setMasks(prev => {
-          if (!prev.length) return prev;
-          const next = [...prev]; const last = next[next.length - 1];
-          if (last.w < 0) { last.x += last.w; last.w = Math.abs(last.w); }
-          if (last.h < 0) { last.y += last.h; last.h = Math.abs(last.h); }
-          if (Math.abs(last.w) < 0.005 && Math.abs(last.h) < 0.005) return next.slice(0, -1);
-          return next;
-        });
-      }
-    }
+    const id = drawingId.current;
+    dragging.current = false; maskStart.current = null; drawingId.current = null;
+    if (!maskingMode || !id) return;
+    // Normalise negative sizes from dragging up/left; drop accidental clicks.
+    updateMasks(prev => prev.flatMap(m => {
+      if (m.id !== id) return [m];
+      const x = m.w < 0 ? m.x + m.w : m.x, y = m.h < 0 ? m.y + m.h : m.y;
+      const w = Math.abs(m.w), h = Math.abs(m.h);
+      return w < 0.005 && h < 0.005 ? [] : [{ ...m, x, y, w, h }];
+    }));
   };
 
   const exportConfigJson = () => {
-    const cfg = { wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, wmFilter, wmBlur, exportPrefix };
+    const cfg = { wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, wmFilter, wmBlur, exportPrefix, maskStyle, detectSettings };
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([JSON.stringify(cfg, null, 2)], { type: "application/json" }));
     a.download = "obscurax_settings.json"; a.click();
@@ -395,6 +413,8 @@ export default function ObscuraX() {
         if (cfg.wmFilter) setWmFilter(cfg.wmFilter);
         if (cfg.wmBlur) setWmBlur(cfg.wmBlur);
         if (cfg.exportPrefix) setExportPrefix(cfg.exportPrefix);
+        if (cfg.maskStyle) setMaskStyle({ ...DEFAULT_MASK_STYLE, ...cfg.maskStyle });
+        if (cfg.detectSettings) updateDetectSettings(cfg.detectSettings);
       } catch (_) { setFileError("Invalid configuration file."); }
     };
     reader.readAsText(file);
@@ -415,20 +435,39 @@ export default function ObscuraX() {
 
   const exportBulkZip = async () => {
     if (!images.length) return;
+    // Faces in images the user never opened must still be masked.
+    const autoScan = maskingMode && autoMaskEnabled;
+    if (autoScan && !modelsLoaded) { setFileError(MODEL_MISSING_MSG); return; }
+    setFileError("");
     setBulkProgress({ done: 0, total: images.length }); setExportMsg("Building ZIP…");
     const zip = new JSZip(); const folder = zip.folder("watermarked"); const cfg = wmConfig();
-    for (let i = 0; i < images.length; i++) {
-      const entry = images[i];
-      setBulkProgress({ done: i, total: images.length }); setExportMsg(`Processing ${i + 1} / ${images.length}…`);
-      const imgEl = await new Promise<HTMLImageElement>(resolve => { const el = new Image(); el.onload = () => resolve(el); el.src = entry.src; });
-      const offscr = document.createElement("canvas"); offscr.width = imgEl.naturalWidth; offscr.height = imgEl.naturalHeight;
-      const ctx = offscr.getContext("2d"); if (!ctx) continue;
-      let filter = cfg.wmFilter || "none";
-      if (filter === "blur") filter = `blur(${cfg.wmBlur}px)`;
-      ctx.filter = filter; ctx.drawImage(imgEl, 0, 0); ctx.filter = "none";
-      applyMasks(ctx, offscr.width, offscr.height, entry.masks || []); applyWatermark(ctx, offscr.width, offscr.height, cfg);
-      const blob = await new Promise<Blob | null>(res => offscr.toBlob(res, entry.file.type === "image/png" ? "image/png" : "image/jpeg", 0.96));
-      if (blob) { const buf = await blob.arrayBuffer(); const ext = entry.file.type === "image/png" ? "png" : "jpg"; folder!.file(`${exportPrefix}${entry.file.name.replace(/\.[^.]+$/, "")}.${ext}`, buf); }
+    try {
+      for (let i = 0; i < images.length; i++) {
+        const entry = images[i];
+        setBulkProgress({ done: i, total: images.length }); setExportMsg(`Processing ${i + 1} / ${images.length}…`);
+        const imgEl = await loadImage(entry.src);
+        let entryMasks = entry.masks || [];
+        if (autoScan && !entry.scanned) {
+          setExportMsg(`Detecting faces ${i + 1} / ${images.length}…`);
+          const autos = facesToMasks(await detectFaces(imgEl, detectOpts));
+          entryMasks = [...autos, ...entryMasks.filter(m => !m.isAuto)];
+          setAutoMasks(entry.src, autos);
+        }
+        const offscr = document.createElement("canvas"); offscr.width = imgEl.naturalWidth; offscr.height = imgEl.naturalHeight;
+        const ctx = offscr.getContext("2d"); if (!ctx) continue;
+        let filter = cfg.wmFilter || "none";
+        if (filter === "blur") filter = `blur(${cfg.wmBlur}px)`;
+        ctx.filter = filter; ctx.drawImage(imgEl, 0, 0); ctx.filter = "none";
+        applyMasks(ctx, offscr.width, offscr.height, entryMasks, maskStyle); applyWatermark(ctx, offscr.width, offscr.height, cfg);
+        const blob = await new Promise<Blob | null>(res => offscr.toBlob(res, entry.file.type === "image/png" ? "image/png" : "image/jpeg", 0.96));
+        if (blob) { const buf = await blob.arrayBuffer(); const ext = entry.file.type === "image/png" ? "png" : "jpg"; folder!.file(`${exportPrefix}${entry.file.name.replace(/\.[^.]+$/, "")}.${ext}`, buf); }
+      }
+    } catch (err) {
+      // Don't ship a partial ZIP that may contain unmasked faces.
+      console.error("ObscuraX: Bulk export failed:", err);
+      setFileError("Export stopped: face detection or image processing failed.");
+      setBulkProgress(null); setExportMsg("");
+      return;
     }
     setBulkProgress({ done: images.length, total: images.length }); setExportMsg("Compressing…");
     const zipBlob = await zip.generateAsync({ type: "blob" }, (meta: { percent: number }) => setExpPct(Math.round(meta.percent)));
@@ -436,9 +475,14 @@ export default function ObscuraX() {
     setBulkProgress(null); setExportMsg(""); setExpPct(0); setExported(true);
   };
 
-  const exportVideo = () => {
+  const exportVideo = async () => {
     const cvs = canvasRef.current, vid = vidElRef.current;
     if (!cvs || !vid) return;
+    if (maskingMode && autoMaskEnabled) {
+      if (!modelsLoaded) { setFileError(MODEL_MISSING_MSG); return; }
+      // Never export with a missing or out-of-date face track.
+      if (trackStatus !== "ready" && !(await scanVideo())) return;
+    }
     const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9" : "video/webm";
     const stream = (cvs as any).captureStream(60);
     const recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 5000000 });
@@ -555,73 +599,97 @@ export default function ObscuraX() {
             <Sect>Masking</Sect>
             <div style={{ marginBottom: 16, display: "flex", flexDirection: "column", gap: 8 }}>
               <Toggle label="Masking Mode" value={maskingMode} onChange={setMaskingMode} />
-              {maskingMode && (
-                <Toggle label="Auto-Mask Faces" value={autoMaskEnabled} onChange={val => {
-                  setAutoMaskEnabled(val);
-                  if (!val) {
-                    if (mode === "image") {
-                      setImages(prev => prev.map((img, i) => i === selectedIdx ? { ...img, masks: img.masks.filter(m => !m.isAuto) } : img));
-                    } else {
-                      setMasks(prev => prev.filter(m => !m.isAuto));
-                    }
-                    setSelMaskIdx(null);
-                  }
-                  else autoDetectFaces();
-                }} />
-              )}
-              <div style={{ fontSize: 9, color: C.muted, fontStyle: "italic" }}>{maskingMode ? "Auto-detecting faces + Manual draw" : "Reposition watermark"}</div>
-            </div>
-            {mode === "video" && maskingMode && (
-              <div style={{ marginBottom: 16 }}>
-                <FL>Capture Scope</FL>
-                <div style={{ display: "flex", gap: 5, marginBottom: 10 }}>
-                  <button onClick={() => setVidCaptureScope("frame")} style={{ flex: 1, padding: "7px 0", background: vidCaptureScope === "frame" ? C.purple : C.card, border: `1px solid ${vidCaptureScope === "frame" ? C.purple : C.border}`, borderRadius: 5, color: vidCaptureScope === "frame" ? "#fff" : C.muted, fontSize: 8, cursor: "pointer", fontWeight: 600 }}>IN-FRAME ONLY</button>
-                  <button onClick={() => setVidCaptureScope("entire")} style={{ flex: 1, padding: "7px 0", background: vidCaptureScope === "entire" ? C.purple : C.card, border: `1px solid ${vidCaptureScope === "entire" ? C.purple : C.border}`, borderRadius: 5, color: vidCaptureScope === "entire" ? "#fff" : C.muted, fontSize: 8, cursor: "pointer", fontWeight: 600 }}>ENTIRE VIDEO</button>
+              {maskingMode && <Toggle label="Auto-Mask Faces" value={autoMaskEnabled} onChange={toggleAutoMask} />}
+              <div style={{ fontSize: 9, color: C.muted, fontStyle: "italic" }}>{maskingMode ? "Auto-detecting faces + drag to draw masks" : "Reposition watermark"}</div>
+              {maskingMode && autoMaskEnabled && !modelsLoaded && (
+                <div style={{ fontSize: 9, color: modelError ? C.red : C.muted, lineHeight: 1.5 }}>
+                  {modelError ? "Face model failed to load. Check your connection and reload." : "Loading face model…"}
                 </div>
-                <button onClick={scanVideo} disabled={!modelsLoaded || !videoReady || exporting} style={{ width: "100%", padding: "8px", background: C.purpleBg, border: `1px solid ${C.purple}`, borderRadius: 6, color: C.purple, fontSize: 9, cursor: "pointer", fontWeight: 600, letterSpacing: 1 }}>
-                  {exporting ? "SCANNING..." : "TRIGGER FULL SCAN"}
-                </button>
+              )}
+            </div>
+
+            {maskingMode && autoMaskEnabled && (
+              <div style={{ marginBottom: 16 }}>
+                <FL>Face Detection</FL>
+                <Slider label="Sensitivity" value={Math.round((1 - detectSettings.minConfidence) * 100)} min={10} max={90} fmt={v => `${v}%`}
+                  onChange={v => updateDetectSettings({ minConfidence: 1 - v / 100 })} />
+                <Slider label="Face Padding" value={maskStyle.padding} min={0} max={60} fmt={v => `${v}%`}
+                  onChange={v => setMaskStyle(st => ({ ...st, padding: v }))} />
+                <Toggle label="Small-face boost (slower)" value={detectSettings.smallFaceBoost} onChange={v => updateDetectSettings({ smallFaceBoost: v })} />
+
+                {mode === "image" && images.length > 1 && (
+                  <div style={{ marginTop: 12 }}>
+                    {unscannedCount > 0 ? (
+                      <button onClick={detectAllImages} disabled={!modelsLoaded || !!scan} style={{ width: "100%", padding: "8px", background: C.goldBg, border: `1px solid ${C.goldDim}`, borderRadius: 6, color: C.gold, fontSize: 9, cursor: "pointer", fontWeight: 600, letterSpacing: 1 }}>
+                        {scan ? scan.label.toUpperCase() : `DETECT IN ALL IMAGES (${unscannedCount} LEFT)`}
+                      </button>
+                    ) : (
+                      <div style={{ fontSize: 9, color: C.teal }}>✓ All {images.length} images scanned for faces</div>
+                    )}
+                    {unscannedCount > 0 && !scan && <div style={{ fontSize: 9, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>Unscanned images are detected automatically on ZIP export.</div>}
+                  </div>
+                )}
+
+                {mode === "video" && (
+                  <div style={{ marginTop: 14 }}>
+                    <FL>Face Tracking</FL>
+                    <Slider label="Scan Rate" value={detectSettings.scanFps} min={2} max={15} fmt={v => `${v} fps`} accent={C.purple}
+                      onChange={v => updateDetectSettings({ scanFps: v })} />
+                    <div style={{ fontSize: 9, lineHeight: 1.5, marginBottom: 8, color: trackStatus === "stale" ? C.gold : trackStatus === "ready" ? C.teal : C.muted }}>
+                      {trackStatus === "idle" && "Not scanned yet. Masks will follow faces frame by frame once scanned."}
+                      {trackStatus === "scanning" && (scan?.label ?? "Tracking faces…")}
+                      {trackStatus === "stale" && "Settings changed or scan cancelled. Rescan to apply (export rescans automatically)."}
+                      {trackStatus === "ready" && (faceTrack.length === 0
+                        ? "Face track cleared."
+                        : `✓ Tracking up to ${faceTrack.reduce((mx, smp) => Math.max(mx, smp.boxes.length), 0)} face(s) across ${faceTrack.length} samples`)}
+                    </div>
+                    {trackStatus === "scanning" ? (
+                      <button onClick={cancelScan} style={{ width: "100%", padding: "8px", background: "#3d1414", border: "1px solid #632222", borderRadius: 6, color: "#ff8a8a", fontSize: 9, cursor: "pointer", fontWeight: 600, letterSpacing: 1 }}>
+                        CANCEL SCAN
+                      </button>
+                    ) : (
+                      <button onClick={scanVideo} disabled={!modelsLoaded || !videoReady || exporting} style={{ width: "100%", padding: "8px", background: C.purpleBg, border: `1px solid ${C.purple}`, borderRadius: 6, color: C.purple, fontSize: 9, cursor: "pointer", fontWeight: 600, letterSpacing: 1 }}>
+                        {trackStatus === "idle" ? "SCAN VIDEO FOR FACES" : "RESCAN VIDEO"}
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {scan && (
+                  <div style={{ marginTop: 8, height: 3, borderRadius: 2, background: C.border }}>
+                    <div style={{ width: `${scan.pct}%`, height: "100%", background: mode === "video" ? C.purple : C.gold, borderRadius: 2, transition: "width .2s" }} />
+                  </div>
+                )}
               </div>
             )}
+
             {maskingMode && (
               <div style={{ marginBottom: 12 }}>
                 <FL>Mask Style</FL>
-                <div style={{ display: "flex", gap: 5 }}>
-                  {(["blur", "pixelate", "box"] as Mask["type"][]).map(m => (
-                    <button key={m} onClick={() => {
-                      setMaskType(m);
-                      // Apply chosen style to ALL masks on this item (single style per item)
-                      if (mode === "image") {
-                        setImages(prev => prev.map((img, i) => i === selectedIdx ? { ...img, masks: img.masks.map(mk => ({ ...mk, type: m })) } : img));
-                      } else {
-                        setMasks(prev => prev.map(mk => ({ ...mk, type: m })));
-                      }
-                    }} style={{ flex: 1, padding: "6px 0", background: maskType === m ? C.gold : C.card, border: `1px solid ${maskType === m ? C.gold : C.border}`, borderRadius: 5, color: maskType === m ? C.bg : C.muted, fontSize: 9, cursor: "pointer", textTransform: "uppercase", fontWeight: maskType === m ? 700 : 400 }}>
-                      {m === "pixelate" ? "PIXEL" : m}
-                    </button>
-                  ))}
-                </div>
+                <Seg value={maskStyle.type} onChange={t => setMaskStyle(st => ({ ...st, type: t }))}
+                  options={[{ value: "blur", label: "BLUR" }, { value: "pixelate", label: "PIXEL" }, { value: "box", label: "BOX" }]} />
+                <FL>Shape</FL>
+                <Seg value={maskStyle.shape} onChange={sh => setMaskStyle(st => ({ ...st, shape: sh }))}
+                  options={[{ value: "ellipse", label: "OVAL" }, { value: "rect", label: "RECTANGLE" }]} />
+                {maskStyle.type === "box" ? (
+                  <>
+                    <FL>Box Colour</FL>
+                    <div style={{ display: "flex", gap: 5, marginBottom: 14, alignItems: "center" }}>
+                      <input type="color" value={maskStyle.color} onChange={e => setMaskStyle(st => ({ ...st, color: e.target.value }))} style={{ width: 30, height: 26, border: `1px solid ${C.border}`, borderRadius: 6, cursor: "pointer", padding: 2, background: "none" }} />
+                      {PALETTE.map(clr => <div key={clr} onClick={() => setMaskStyle(st => ({ ...st, color: clr }))} style={{ width: 22, height: 22, borderRadius: 5, background: clr, cursor: "pointer", border: maskStyle.color === clr ? `2px solid ${C.gold}` : `1px solid ${C.border}`, boxSizing: "border-box", flexShrink: 0 }} />)}
+                    </div>
+                  </>
+                ) : (
+                  <Slider label={maskStyle.type === "blur" ? "Blur Strength" : "Pixel Size"} value={maskStyle.strength} min={1} max={100} fmt={v => `${v}%`}
+                    onChange={v => setMaskStyle(st => ({ ...st, strength: v }))} />
+                )}
+                <Slider label="Edge Feather" value={maskStyle.feather} min={0} max={100} fmt={v => `${v}%`}
+                  onChange={v => setMaskStyle(st => ({ ...st, feather: v }))} />
               </div>
             )}
-            {maskingMode && maskType === "blur" && (
-              <Slider label="Blur Intensity" value={maskBlur} min={2} max={80} onChange={val => {
-                setMaskBlur(val);
-                if (mode === "image") {
-                  setImages(prev => prev.map((img, i) => i === selectedIdx ? { ...img, masks: img.masks.map(m => m.type === "blur" ? { ...m, blurLevel: val } : m) } : img));
-                } else {
-                  setMasks(prev => prev.map(m => m.type === "blur" ? { ...m, blurLevel: val } : m));
-                }
-              }} />
-            )}
-            {masks.length > 0 && (
-              <button onClick={() => {
-                if (mode === "image") {
-                  setImages(prev => prev.map((img, i) => i === selectedIdx ? { ...img, masks: [] } : img));
-                } else {
-                  setMasks([]);
-                }
-              }} style={{ width: "100%", padding: "7px", background: "#3d1414", border: "1px solid #632222", borderRadius: 6, color: "#ff8a8a", fontSize: 8, letterSpacing: 1.5, cursor: "pointer" }}>
-                CLEAR ALL MASKS ({masks.length})
+            {(masks.length > 0 || (mode === "video" && faceTrack.length > 0)) && (
+              <button onClick={clearAllMasks} style={{ width: "100%", padding: "7px", background: "#3d1414", border: "1px solid #632222", borderRadius: 6, color: "#ff8a8a", fontSize: 8, letterSpacing: 1.5, cursor: "pointer" }}>
+                CLEAR ALL MASKS ({masks.length}{mode === "video" && faceTrack.length > 0 ? " + FACE TRACK" : ""})
               </button>
             )}
             <div style={{ height: 16 }} />
@@ -677,7 +745,7 @@ export default function ObscuraX() {
 
             {mode === "video" && (
               <>
-                <Btn onClick={exportVideo} disabled={!videoReady || exporting}>
+                <Btn onClick={exportVideo} disabled={!videoReady || exporting || trackStatus === "scanning"}>
                   {exporting ? `● RECORDING  ${expPct}%` : "↓ EXPORT VIDEO"}
                 </Btn>
                 {exporting && <div style={{ marginTop: 8, height: 3, borderRadius: 2, background: C.border }}><div style={{ width: `${expPct}%`, height: "100%", background: C.gold, borderRadius: 2, transition: "width .3s" }} /></div>}
@@ -786,6 +854,8 @@ export default function ObscuraX() {
       {videoSrc && mode === "video" && (
         <video key={videoSrc} src={videoSrc} crossOrigin="anonymous"
           onLoadedMetadata={e => onVideoLoad(e.target as HTMLVideoElement)}
+          onLoadedData={() => drawRef.current()}
+          onSeeked={() => drawRef.current()}
           autoPlay loop muted={videoMuted} playsInline
           style={{ position: "fixed", top: -9999, left: -9999, opacity: 0, pointerEvents: "none", width: 1, height: 1 }}
         />
