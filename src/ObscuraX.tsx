@@ -3,8 +3,9 @@ import JSZip from "jszip/dist/jszip.min.js";
 
 import { ImageEntry, BulkProgress, WatermarkConfig, Mask, MaskStyle, DetectSettings, TrackSample, TrackInfo } from "./types";
 import { WM, PRESETS, FONTS, PALETTE, MAX_FILES, FILTERS, DEFAULT_MASK_STYLE, DEFAULT_DETECT_SETTINGS } from "./constants/config";
-import { applyWatermark, applyMasks, maskRect } from "./utils/canvas";
+import { applyWatermark, applyMasks, maskRect, resolveFilter, drawFiltered, filterPreviewCss } from "./utils/canvas";
 import { loadFaceModels, detectFaces, facesToMasks, boxesAt, seekVideo, overlap, cropThumb, createTrackLinker } from "./utils/faceDetection";
+import { upscaleImage, upscaledSize, fitScale, UPSCALE_FACTORS, UPSCALE_MAX_PIXELS } from "./utils/upscale";
 import { detectImageResolution } from "./helpers/media";
 import { Field, TextInput, Select, SwitchRow, Range, Seg, ArmedBtn, Spinner, Progress, Modal } from "./components/common/Atoms";
 import { useTheme } from "./hooks/useTheme";
@@ -19,6 +20,13 @@ const loadImage = (src: string) => new Promise<HTMLImageElement>((resolve, rejec
   el.onerror = reject;
   el.src = src;
 });
+
+/** Lets React paint (e.g. a progress message) before a long synchronous render. */
+const nextFrame = () => new Promise<void>(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+
+const canvasBlob = (c: HTMLCanvasElement, type: string) => new Promise<Blob | null>(res => c.toBlob(res, type, 0.96));
+
+const baseName = (name: string) => name.replace(/\.[^.]+$/, "");
 
 const MODEL_MISSING_MSG = "The face model hasn't loaded, so faces can't be found. Wait a moment, or turn off Find faces automatically, before exporting.";
 
@@ -81,6 +89,9 @@ export default function ObscuraX() {
   const [wmFilter, setWmFilter] = useState("none");
   const [wmBlur, setWmBlur] = useState(4);
   const [exportPrefix, setExportPrefix] = useState("watermarked_");
+  // Export-only: images are enlarged by this factor, then sharpened (0–100).
+  const [upscaleFactor, setUpscaleFactor] = useState<number>(1);
+  const [upscaleSharpen, setUpscaleSharpen] = useState(40);
 
   // Image mode: mirror of the selected image's masks. Video mode: manual masks only
   // (auto face masks come from faceTrack, per frame).
@@ -183,11 +194,7 @@ export default function ObscuraX() {
     if (!ctx) return;
     ctx.clearRect(0, 0, cvs.width, cvs.height);
     const cfg = wmConfig();
-    let filter = cfg.wmFilter || "none";
-    if (filter === "blur") filter = `blur(${cfg.wmBlur}px)`;
-    ctx.filter = filter;
-    ctx.drawImage(med, 0, 0, cvs.width, cvs.height);
-    ctx.filter = "none";
+    drawFiltered(ctx, med, cvs.width, cvs.height, resolveFilter(cfg.wmFilter, cfg.wmBlur, cvs.width, cvs.height));
     let active = masks;
     if (mode === "video" && autoMaskEnabled && faceTrack.length) {
       active = [...videoFaceMasks((med as HTMLVideoElement).currentTime), ...masks];
@@ -468,7 +475,7 @@ export default function ObscuraX() {
   };
 
   const exportConfigJson = () => {
-    const cfg = { wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, wmFilter, wmBlur, exportPrefix, maskStyle, detectSettings };
+    const cfg = { wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, wmFilter, wmBlur, exportPrefix, maskStyle, detectSettings, upscale: { factor: upscaleFactor, sharpen: upscaleSharpen } };
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([JSON.stringify(cfg, null, 2)], { type: "application/json" }));
     a.download = "obscurax_settings.json"; a.click();
@@ -494,22 +501,64 @@ export default function ObscuraX() {
         if (cfg.exportPrefix) setExportPrefix(cfg.exportPrefix);
         if (cfg.maskStyle) setMaskStyle({ ...DEFAULT_MASK_STYLE, ...cfg.maskStyle });
         if (cfg.detectSettings) updateDetectSettings(cfg.detectSettings);
+        if ((UPSCALE_FACTORS as readonly number[]).includes(cfg.upscale?.factor)) setUpscaleFactor(cfg.upscale.factor);
+        if (typeof cfg.upscale?.sharpen === "number") setUpscaleSharpen(Math.min(100, Math.max(0, cfg.upscale.sharpen)));
       } catch { setFileError("That settings file couldn't be read. Choose a file saved by ObscuraX."); }
     };
     reader.readAsText(file);
   };
 
-  const exportSingleImage = () => {
-    draw();
-    if (!canvasRef.current) return;
-    const isPng = images[selectedIdx]?.file?.type === "image/png";
-    canvasRef.current.toBlob(blob => {
-      if (!blob) return;
+  /**
+   * Renders one image for export: enlarged (when upscaling), then filter, masks and
+   * watermark. Masks are in relative units; pixel sizes (watermark, filter blur) are
+   * scaled so the export looks like the preview, only bigger.
+   */
+  const renderForExport = (imgEl: HTMLImageElement, entryMasks: Mask[]) => {
+    const sw = imgEl.naturalWidth, sh = imgEl.naturalHeight;
+    const { w, h, scale } = upscaledSize(sw, sh, upscaleFactor);
+    const base = wmConfig();
+    const cfg = { ...base, wmSize: base.wmSize * scale, wmBlur: base.wmBlur * scale };
+    const filter = resolveFilter(cfg.wmFilter, cfg.wmBlur, w, h);
+    const up = scale > 1 ? upscaleImage(imgEl, sw, sh, w, h, upscaleSharpen) : null;
+    let out: HTMLCanvasElement;
+    if (up && filter === "none") out = up;
+    else {
+      out = document.createElement("canvas"); out.width = w; out.height = h;
+      const c = out.getContext("2d")!;
+      c.imageSmoothingQuality = "high";
+      drawFiltered(c, up ?? imgEl, w, h, filter);
+      if (up) up.width = 0;
+    }
+    const ctx = out.getContext("2d")!;
+    applyMasks(ctx, w, h, entryMasks, maskStyle);
+    applyWatermark(ctx, w, h, cfg);
+    return out;
+  };
+
+  const exportSingleImage = async (): Promise<boolean> => {
+    const entry = images[selectedIdx], imgEl = imgElRef.current;
+    if (!entry || !imgEl) return false;
+    setFileError("");
+    setBulkProgress({ done: 0, total: 1 }); setExportMsg(upscaleFactor > 1 ? "Upscaling…" : "Rendering…");
+    try {
+      await nextFrame();
+      const isPng = entry.file.type === "image/png";
+      const out = renderForExport(imgEl, masks);
+      const blob = await canvasBlob(out, isPng ? "image/png" : "image/jpeg");
+      out.width = 0;
+      if (!blob) throw new Error("Canvas could not be encoded");
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = `${exportPrefix}${images[selectedIdx]?.file?.name ?? "image"}.${isPng ? "png" : "jpg"}`;
+      a.download = `${exportPrefix}${baseName(entry.file.name)}.${isPng ? "png" : "jpg"}`;
       a.click(); showToast("Image downloaded");
-    }, isPng ? "image/png" : "image/jpeg", 0.96);
+      return true;
+    } catch (err) {
+      console.error("ObscuraX: Export failed:", err);
+      setFileError(upscaleFactor > 1 ? "The image couldn't be saved at this size. Try a smaller size." : "The image couldn't be saved. Try again.");
+      return false;
+    } finally {
+      setBulkProgress(null); setExportMsg("");
+    }
   };
 
   const exportBulkZip = async (): Promise<boolean> => {
@@ -519,7 +568,7 @@ export default function ObscuraX() {
     if (autoScan && !modelsLoaded) { setFileError(MODEL_MISSING_MSG); return false; }
     setFileError("");
     setBulkProgress({ done: 0, total: images.length }); setExportMsg("Building ZIP…");
-    const zip = new JSZip(); const folder = zip.folder("watermarked"); const cfg = wmConfig();
+    const zip = new JSZip(); const folder = zip.folder("watermarked");
     try {
       for (let i = 0; i < images.length; i++) {
         const entry = images[i];
@@ -532,14 +581,13 @@ export default function ObscuraX() {
           entryMasks = mergeAutoMasks(entryMasks, autos);
           setAutoMasks(entry.src, autos);
         }
-        const offscr = document.createElement("canvas"); offscr.width = imgEl.naturalWidth; offscr.height = imgEl.naturalHeight;
-        const ctx = offscr.getContext("2d"); if (!ctx) continue;
-        let filter = cfg.wmFilter || "none";
-        if (filter === "blur") filter = `blur(${cfg.wmBlur}px)`;
-        ctx.filter = filter; ctx.drawImage(imgEl, 0, 0); ctx.filter = "none";
-        applyMasks(ctx, offscr.width, offscr.height, entryMasks, maskStyle); applyWatermark(ctx, offscr.width, offscr.height, cfg);
-        const blob = await new Promise<Blob | null>(res => offscr.toBlob(res, entry.file.type === "image/png" ? "image/png" : "image/jpeg", 0.96));
-        if (blob) { const buf = await blob.arrayBuffer(); const ext = entry.file.type === "image/png" ? "png" : "jpg"; folder!.file(`${exportPrefix}${entry.file.name.replace(/\.[^.]+$/, "")}.${ext}`, buf); }
+        if (upscaleFactor > 1) { setExportMsg(`Upscaling ${i + 1} of ${images.length}…`); await nextFrame(); }
+        const isPng = entry.file.type === "image/png";
+        const offscr = renderForExport(imgEl, entryMasks);
+        const blob = await canvasBlob(offscr, isPng ? "image/png" : "image/jpeg");
+        offscr.width = 0;
+        if (!blob) throw new Error(`Could not encode ${entry.file.name}`);
+        folder!.file(`${exportPrefix}${baseName(entry.file.name)}.${isPng ? "png" : "jpg"}`, await blob.arrayBuffer());
       }
     } catch (err) {
       // Don't ship a partial ZIP that may contain unmasked faces.
@@ -727,9 +775,14 @@ export default function ObscuraX() {
   const runExport = async () => {
     if (mode === "video") { setExportOpen(false); await exportVideo(); return; }
     if (exportAll) { if (await exportBulkZip()) setExportOpen(false); return; }
-    exportSingleImage();
-    setExportOpen(false);
+    if (await exportSingleImage()) setExportOpen(false);
   };
+
+  // Export size: what the upscale setting produces for the images being exported.
+  const exportImgs = mode !== "image" ? [] : exportAll ? images : activeImg ? [activeImg] : [];
+  const cappedCount = upscaleFactor > 1 ? exportImgs.filter(img => fitScale(img.w, img.h, upscaleFactor) < upscaleFactor).length : 0;
+  const outSize = activeImg && !exportAll ? upscaledSize(activeImg.w || canvasDims.w, activeImg.h || canvasDims.h, upscaleFactor) : null;
+  const fmtScale = (s: number) => `${Number(s.toFixed(1))}×`;
 
   // Status for the dock: what the face blur is doing right now.
   let faceStatus: { text: string; spin?: boolean; ok?: boolean } | null = null;
@@ -1094,7 +1147,7 @@ export default function ObscuraX() {
               {FILTERS.map(f => (
                 <button key={f.value} type="button" className="flt" aria-pressed={wmFilter === f.value} onClick={() => setWmFilter(f.value)}>
                   <span className="thumb">
-                    {filterThumb && <img src={filterThumb} alt="" style={{ filter: f.value === "blur" ? "blur(2px)" : f.value }} />}
+                    {filterThumb && <img src={filterThumb} alt="" style={{ filter: filterPreviewCss(f.value) }} />}
                   </span>
                   {f.label}
                 </button>
@@ -1116,10 +1169,36 @@ export default function ObscuraX() {
           <div className="stat"><div className="k">{exportAll ? "Images" : "File"}</div><div className="v" title={mediaName}>{exportAll ? images.length : mediaName}</div></div>
           <div className="stat"><div className="k">Saves as</div><div className="v">{mode === "video" ? "WebM video" : exportAll ? "ZIP of images" : activeImg?.file.type === "image/png" ? "PNG" : "JPG"}</div></div>
         </div>
+        {mode === "image" && (
+          <>
+            <Field label="Size">
+              <Seg label="Output size" value={String(upscaleFactor)} onChange={v => setUpscaleFactor(Number(v))}
+                options={UPSCALE_FACTORS.map(f => ({ value: String(f), label: f === 1 ? "Original" : `${f}×` }))} />
+            </Field>
+            {outSize && outSize.w > 0 && (
+              <p className="hint num">
+                {outSize.scale > 1 ? <>{activeImg!.w} × {activeImg!.h} → <strong>{outSize.w} × {outSize.h} px</strong></> : <>{outSize.w} × {outSize.h} px</>}
+                {cappedCount > 0 && <> · enlarged {fmtScale(outSize.scale)}, the most the browser can save</>}
+              </p>
+            )}
+            {exportAll && upscaleFactor > 1 && (
+              <p className="hint">
+                Each image is enlarged {upscaleFactor}×.
+                {cappedCount > 0 && ` ${plural(cappedCount, "large image")} ${cappedCount === 1 ? "is" : "are"} enlarged less, to stay under ${UPSCALE_MAX_PIXELS / 1e6} MP.`}
+              </p>
+            )}
+            {upscaleFactor > 1 && (
+              <>
+                <Range label="Sharpen" value={upscaleSharpen} min={0} max={100} fmt={v => (v ? `${v}%` : "Off")} onChange={setUpscaleSharpen} />
+                <p className="hint">Smooth resampling plus sharpening. Edges stay crisp, but detail the photo doesn't have can't be added.</p>
+              </>
+            )}
+          </>
+        )}
         <Field label="File name prefix" htmlFor="exp-prefix"><TextInput id="exp-prefix" value={exportPrefix} onChange={setExportPrefix} placeholder="watermarked_" /></Field>
         {faceBlurOn && exportAll && unscannedCount > 0 && <p className="hint">{plural(unscannedCount, "image")} {unscannedCount === 1 ? "hasn't" : "haven't"} been checked for faces yet. {unscannedCount === 1 ? "It's" : "They're"} checked before saving.</p>}
         {faceBlurOn && mode === "video" && trackStatus !== "ready" && <p className="hint">The video is scanned for faces before recording.</p>}
-        {bulkProgress && <Progress label={exportMsg || "Exporting…"} meta={`${bulkProgress.done} of ${bulkProgress.total}`} pct={(bulkProgress.done / bulkProgress.total) * 100} />}
+        {bulkProgress && <Progress label={exportMsg || "Exporting…"} meta={bulkProgress.total > 1 ? `${bulkProgress.done} of ${bulkProgress.total}` : undefined} pct={(bulkProgress.done / bulkProgress.total) * 100} />}
         {fileError && <div className="notice err" role="alert">{fileError}</div>}
         <div className="modal-foot">
           <div>
