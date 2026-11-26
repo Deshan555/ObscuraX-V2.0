@@ -37,6 +37,42 @@ export function applyWatermark(ctx: CanvasRenderingContext2D, W: number, H: numb
   ctx.restore();
 }
 
+// ── Whole-image filters ───────────────────────────────────────────────────────
+
+/** Soft blur radii as a fraction of the image's shorter side, so they look the same at any resolution. */
+const SOFT_BLUR: Record<string, number> = { "soft-blur": 0.004, "ultra-soft-blur": 0.012 };
+
+/** Thumbnail CSS for a FILTERS value (thumbnails are ~80 px, so fixed radii are fine). */
+export function filterPreviewCss(filter: string): string {
+  if (filter === "blur") return "blur(2px)";
+  if (filter === "soft-blur") return "blur(1px)";
+  if (filter === "ultra-soft-blur") return "blur(3px)";
+  return filter;
+}
+
+/**
+ * Canvas filter for a FILTERS value at a W × H output. `blurPx` is the radius of the
+ * adjustable "blur" filter, already scaled to this output.
+ */
+export function resolveFilter(filter: string, blurPx: number, W: number, H: number): string {
+  if (!filter || filter === "none") return "none";
+  if (filter === "blur") return blurPx > 0 ? `blur(${blurPx}px)` : "none";
+  const soft = SOFT_BLUR[filter];
+  if (soft) return `blur(${Math.max(1, Math.min(W, H) * soft).toFixed(1)}px)`;
+  return filter;
+}
+
+/**
+ * Draws `src` over the whole canvas with a filter. Blurs are laid over an unblurred
+ * copy so the borders don't fade to transparent (the blur pulls in empty pixels there).
+ */
+export function drawFiltered(ctx: CanvasRenderingContext2D, src: CanvasImageSource, W: number, H: number, filter: string) {
+  if (filter.startsWith("blur(")) ctx.drawImage(src, 0, 0, W, H);
+  ctx.filter = filter;
+  ctx.drawImage(src, 0, 0, W, H);
+  ctx.filter = "none";
+}
+
 // ── Masks ─────────────────────────────────────────────────────────────────────
 
 const supportsCanvasFilter =
