@@ -31,6 +31,8 @@ export const FILTERS = [
   { label: "Sepia",     value: "sepia(100%)" },
   { label: "Invert",    value: "invert(100%)" },
   { label: "Blur",      value: "blur" },
+  { label: "Soft blur",       value: "soft-blur" },
+  { label: "Ultra soft blur", value: "ultra-soft-blur" },
   { label: "Bright",    value: "brightness(1.5)" },
   { label: "Contrast",  value: "contrast(1.6)" },
   { label: "Vintage",   value: "sepia(50%) contrast(1.2) brightness(0.9)" },
