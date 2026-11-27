@@ -18,9 +18,11 @@ After the first visit it works with no internet connection at all, and it can be
 | **Filters** | Grayscale, Sepia, Invert, Blur, Soft blur, Brightness, Contrast, Vintage |
 | **Face Detection** | Automatic face-detection with oval or rectangle masks (blur / pixelate / solid), soft edges, per-face on/off |
 | **Manual Masking** | Draw custom areas for anything else you want to redact |
-| **Video Support** | Faces are tracked frame to frame; timeline scrubber, mute/unmute, WebM export (MP4 on Safari) |
+| **Video Support** | Faces are tracked frame to frame; timeline scrubber, mute/unmute; exports keep the sound (WebM, or MP4 on Safari) |
 | **Bulk Export** | Process up to 20 images and download as a single ZIP archive |
 | **Upscaling** | Export images at 2×, 3× or 4× with sharpening |
+| **Undo / Redo** | Every edit (drawn areas, faces turned on/off, watermark, filter, mask style) — buttons or Ctrl/⌘ + Z |
+| **Keeps your work** | Settings are remembered; the last photos or video, with their masks, are offered back on the next visit |
 | **Config Persistence** | Export/import your full watermark settings as a `.json` file |
 | **Offline & installable** | Service worker caches the app and face model; installable as a PWA |
 | **Mobile** | Phone layout with bottom tab bar, touch drawing, pinch-to-zoom, share-to-Photos |
@@ -49,6 +51,8 @@ After the first visit it works with no internet connection at all, and it can be
 |---|---|
 | **HTML5 Canvas API** | All compositing, watermark rendering, mask application |
 | **MediaRecorder API** | Captures canvas stream to WebM (or MP4 on Safari) video for export |
+| **Web Audio API** | Routes the video's soundtrack into the recording |
+| **IndexedDB / localStorage** | Saved session (media + masks) and preferences, on the device only |
 | **JSZip** | In-browser ZIP creation for bulk image download |
 | **FileReader / Blob / URL.createObjectURL** | Zero-copy image/video loading and download |
 | **Web Share API** | On phones, hands exports to the share sheet (e.g. Save Image to Photos) |
@@ -179,6 +183,7 @@ watermark-studio/
 │   │   ├── config.ts         # WM types, font list, filter list, presets
 │   │   └── theme.ts          # Colour tokens
 │   ├── hooks/
+│   │   ├── useHistory.ts     # Undo / redo stack
 │   │   └── useTheme.ts       # Light / dark / system colour mode
 │   ├── types/
 │   │   └── index.ts          # ImageEntry, Mask, WatermarkConfig interfaces
@@ -186,6 +191,7 @@ watermark-studio/
 │   │   ├── canvas.ts         # applyWatermark(), applyMasks() — pure canvas logic
 │   │   ├── faceDetection.ts  # Model loading, detection, video face tracking
 │   │   ├── upscale.ts        # Export upscaling and sharpening
+│   │   ├── session.ts        # Saved preferences and session (localStorage, IndexedDB)
 │   │   └── device.ts         # Per-device canvas limits (phones, iOS Safari)
 │   └── helpers/
 │       └── media.ts          # detectImageResolution() helper
@@ -241,12 +247,28 @@ The service worker only runs in the production build (`npm run build` + `npm run
 
 ---
 
+## ↩️ Undo & Saved Work
+
+- **Undo / redo** covers your own edits: drawing and deleting blur areas, turning faces on or off, clearing masks, and watermark, filter and mask-style changes (a slider drag is one step). Use the arrows in the top bar, or Ctrl/⌘ + Z and Ctrl/⌘ + Shift + Z (Ctrl + Y on Windows).
+- Face detection results are never undone on their own: undo can't make a face that was found go unblurred unless you turned it off yourself. Undoing *Clear all masks* finds the faces again.
+- **Preferences** (watermark text, logo, style, position, filter, mask style, detection and export options) are remembered automatically.
+- **Your last session** (photos or video, drawn areas, face choices and the video's face track) is saved on this device as you work. Next time, the start screen offers *Continue where you left off?*. Choose *Start over* to delete it; *Remove all* also deletes it. Videos over 500 MB aren't kept.
+- Everything is stored in this browser only (IndexedDB and localStorage), never uploaded.
+
+---
+
+## 🎬 Video Export
+
+The video plays through once in real time while it's recorded, so the export has the same length and speed as the original, **with its sound**. The soundtrack is routed through the Web Audio API into the recording (the mute button only affects your speakers). Use *Stop* in the timeline to cancel. If a browser refuses to start the sound, the video is saved without it and the message says so.
+
+---
+
 ## 📴 Offline & Install
 
 On the first visit the service worker downloads and caches everything the app needs (≈ 7 MB: app code, fonts, icons and the face model) and shows **"Ready to work offline"**. After that ObscuraX opens and works with no connection, including face detection and every export.
 
 - **Install:** in Chrome/Edge use *Install app* in the address bar; on Android, *Add to Home screen*; on iPhone/iPad, Safari's *Share → Add to Home Screen*.
-- **Updates:** a new deploy is downloaded in the background. The app then shows **"A new version is ready"** with a *Reload* button. It never reloads by itself, so an edit in progress isn't lost.
+- **Updates:** a new deploy is downloaded in the background. The app then shows **"A new version is ready"** with a *Reload* button. It never reloads by itself; your work is saved first and offered back after the reload.
 - **Offline indicator:** the top bar shows *Offline* when there's no connection, as a reminder that everything still works.
 - **How it works:** at build time, `vite.config.js` lists every file in `dist/`, hashes their contents into a version, and writes `dist/sw.js` from `src/sw-template.js`. Each new version gets its own cache, and old caches are deleted once it takes over.
 
@@ -271,7 +293,7 @@ On screens narrower than 760 px the editor switches to a phone layout:
 3. **Style it** — pick font, colour, size, opacity; toggle bold and shadow.
 4. **Position it** — click a preset or drag directly on the live canvas preview.
 5. **Enable masking** — toggle Masking Mode. Faces are detected automatically; draw additional rectangles manually.
-6. **Export** — single image (optionally upscaled), bulk ZIP, or WebM/MP4 video.
+6. **Export** — single image (optionally upscaled), bulk ZIP, or WebM/MP4 video with sound.
 7. **Save settings** — use Export Config / Import Config to reuse your setup.
 
 ---

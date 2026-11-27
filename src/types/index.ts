@@ -1,4 +1,6 @@
 export interface ImageEntry {
+  /** Stable across reloads (object URLs in `src` are not); keys the saved session. */
+  id?: string;
   file: File;
   src: string;
   w: number;

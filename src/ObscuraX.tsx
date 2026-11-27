@@ -8,12 +8,17 @@ import { loadFaceModels, detectFaces, facesToMasks, boxesAt, seekVideo, overlap,
 import { upscaleImage, upscaledSize, fitScale, UPSCALE_FACTORS, UPSCALE_MAX_PIXELS } from "./utils/upscale";
 import { scaleToFit, PREVIEW_MAX_PIXELS, CANVAS_MAX_PIXELS, isTouch } from "./utils/device";
 import { usePwa, useOnline, applyUpdate, dismissUpdate, clearOfflineReady } from "./pwa";
+import { useHistory } from "./hooks/useHistory";
+import {
+  loadPrefs, savePrefs, Prefs, loadSession, saveSession, clearSession, saveLogo, loadLogo,
+  LoadedSession, Session, SavedVideo, MAX_SAVED_VIDEO_BYTES,
+} from "./utils/session";
 import { detectImageResolution } from "./helpers/media";
 import { Field, TextInput, Select, SwitchRow, Range, Seg, ArmedBtn, Spinner, Progress, Modal } from "./components/common/Atoms";
 import { useTheme } from "./hooks/useTheme";
 import {
   Type, ScanFace, SlidersHorizontal, Eye, EyeOff, Trash2, SquareDashed, Download, Upload, ImagePlus, Plus, Minus, Maximize, Sun, Moon, Monitor, Play, Pause, Volume2, VolumeX, X, Check, FileJson,
-  WifiOff, ChevronDown, Share2, RefreshCw,
+  WifiOff, ChevronDown, Share2, RefreshCw, Undo2, Redo2, History, Square,
   ArrowUpLeft, ArrowUp, ArrowUpRight, ArrowLeft, Dot, ArrowRight, ArrowDownLeft, ArrowDown, ArrowDownRight, LucideIcon,
 } from "lucide-react";
 
@@ -47,13 +52,20 @@ const canShareFile = (f: File) => isTouch && typeof navigator.canShare === "func
 
 /** Video formats MediaRecorder may support, best first. Safari records MP4 only. */
 const RECORD_TYPES = [
-  { mime: "video/webm;codecs=vp9", ext: "webm" },
-  { mime: "video/webm;codecs=vp8", ext: "webm" },
-  { mime: "video/webm", ext: "webm" },
-  { mime: "video/mp4;codecs=avc1", ext: "mp4" },
-  { mime: "video/mp4", ext: "mp4" },
+  { mime: "video/webm;codecs=vp9,opus", ext: "webm", audio: true },
+  { mime: "video/webm;codecs=vp8,opus", ext: "webm", audio: true },
+  { mime: "video/webm;codecs=vp9", ext: "webm", audio: false },
+  { mime: "video/webm;codecs=vp8", ext: "webm", audio: false },
+  { mime: "video/webm", ext: "webm", audio: true },
+  { mime: "video/mp4;codecs=avc1,mp4a.40.2", ext: "mp4", audio: true },
+  { mime: "video/mp4;codecs=avc1", ext: "mp4", audio: false },
+  { mime: "video/mp4", ext: "mp4", audio: true },
 ];
-const recordType = () => typeof MediaRecorder === "undefined" ? null : RECORD_TYPES.find(t => MediaRecorder.isTypeSupported(t.mime)) ?? null;
+const recordType = (withAudio = true) => typeof MediaRecorder === "undefined" ? null
+  : RECORD_TYPES.find(t => (!withAudio || t.audio) && MediaRecorder.isTypeSupported(t.mime)) ?? null;
+
+/** Fallback for crypto.randomUUID, which only exists on HTTPS / localhost. */
+const newId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
 const MODEL_MISSING_MSG = "The face model hasn't loaded, so faces can't be found. Wait a moment, or turn off Find faces automatically, before exporting.";
 
@@ -86,7 +98,30 @@ function mergeAutoMasks(prev: Mask[], autos: Mask[]): Mask[] {
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
-const fmtTime = (t: number) => `${Math.floor(t / 60)}:${Math.floor(t % 60).toString().padStart(2, "0")}`;
+
+/** "5 minutes ago", "yesterday"… for the saved-session card. */
+function timeAgo(t: number) {
+  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  const sec = (t - Date.now()) / 1000;
+  for (const [unit, size] of [["year", 31536000], ["month", 2592000], ["day", 86400], ["hour", 3600], ["minute", 60]] as const)
+    if (Math.abs(sec) >= size) return rtf.format(Math.round(sec / size), unit);
+  return "just now";
+}
+
+/** Saved preferences, read once at startup so the first render already uses them. */
+const PREFS = loadPrefs();
+
+type Box = Pick<Mask, "x" | "y" | "w" | "h">;
+/** What undo / redo restores: the user's own edits, never detection results. */
+interface EditSnapshot {
+  wm: Pick<Prefs, "wmType" | "wmText" | "wmLink" | "wmColor" | "wmFont" | "wmSize" | "wmOpacity" | "wmBold" | "wmShadow" | "wmPos" | "activePreset" | "wmFilter" | "wmBlur">;
+  maskStyle: MaskStyle;
+  /** Per image id: drawn areas, and where the faces turned off are (faces are matched by position). */
+  images: Record<string, { drawn: Mask[]; off: Box[]; faces: number }>;
+  video: { drawn: Mask[]; hidden: number[]; tracked: boolean } | null;
+}
+const sameFace = (a: Box, b: Box) => { const o = overlap(a, b); return o.iou > 0.3 || o.contain > 0.6; };
+const fmtTime = (t: number) => Number.isFinite(t) ? `${Math.floor(t / 60)}:${Math.floor(t % 60).toString().padStart(2, "0")}` : "–:––";
 
 export default function ObscuraX() {
   const [images, setImages] = useState<ImageEntry[]>([]);
@@ -100,38 +135,43 @@ export default function ObscuraX() {
   const [videoMuted, setVideoMuted] = useState(true);
   const [videoTime, setVideoTime] = useState(0);
   const [videoDur, setVideoDur] = useState(0);
+  // The video's sound goes through Web Audio once a recording has started (see routeAudio).
+  const [audioRouted, setAudioRouted] = useState(false);
 
   const [mode, setMode] = useState<"image" | "video" | null>(null);
+  // Last visit's work, offered back on the start screen until opened or discarded.
+  const [savedSession, setSavedSession] = useState<LoadedSession | null>(null);
+  const [sessionChecked, setSessionChecked] = useState(false);
   const [dropActive, setDropActive] = useState(false);
   const [fileError, setFileError] = useState("");
 
-  const [wmType, setWmType] = useState<typeof WM[keyof typeof WM]>(WM.TEXT);
-  const [wmText, setWmText] = useState("© Your Brand");
-  const [wmLink, setWmLink] = useState("https://yourbrand.com");
+  const [wmType, setWmType] = useState<typeof WM[keyof typeof WM]>(() => (PREFS.wmType as typeof WM[keyof typeof WM]) ?? WM.TEXT);
+  const [wmText, setWmText] = useState(PREFS.wmText ?? "© Your Brand");
+  const [wmLink, setWmLink] = useState(PREFS.wmLink ?? "https://yourbrand.com");
   const [wmImgFile, setWmImgFile] = useState<File | null>(null);
-  const [wmColor, setWmColor] = useState("#ffffff");
-  const [wmFont, setWmFont] = useState(FONTS[0].value);
-  const [wmSize, setWmSize] = useState(44);
-  const [wmOpacity, setWmOpacity] = useState(75);
-  const [wmBold, setWmBold] = useState(false);
-  const [wmShadow, setWmShadow] = useState(true);
-  const [wmPos, setWmPos] = useState({ x: 0.5, y: 0.93 });
-  const [wmFilter, setWmFilter] = useState("none");
-  const [wmBlur, setWmBlur] = useState(4);
-  const [exportPrefix, setExportPrefix] = useState("watermarked_");
+  const [wmColor, setWmColor] = useState(PREFS.wmColor ?? "#ffffff");
+  const [wmFont, setWmFont] = useState(PREFS.wmFont ?? FONTS[0].value);
+  const [wmSize, setWmSize] = useState(PREFS.wmSize ?? 44);
+  const [wmOpacity, setWmOpacity] = useState(PREFS.wmOpacity ?? 75);
+  const [wmBold, setWmBold] = useState(PREFS.wmBold ?? false);
+  const [wmShadow, setWmShadow] = useState(PREFS.wmShadow ?? true);
+  const [wmPos, setWmPos] = useState(PREFS.wmPos ?? { x: 0.5, y: 0.93 });
+  const [wmFilter, setWmFilter] = useState(PREFS.wmFilter ?? "none");
+  const [wmBlur, setWmBlur] = useState(PREFS.wmBlur ?? 4);
+  const [exportPrefix, setExportPrefix] = useState(PREFS.exportPrefix ?? "watermarked_");
   // Export-only: images are enlarged by this factor, then sharpened (0–100).
-  const [upscaleFactor, setUpscaleFactor] = useState<number>(1);
-  const [upscaleSharpen, setUpscaleSharpen] = useState(40);
+  const [upscaleFactor, setUpscaleFactor] = useState<number>(() => (UPSCALE_FACTORS as readonly number[]).includes(PREFS.upscaleFactor ?? 1) ? PREFS.upscaleFactor ?? 1 : 1);
+  const [upscaleSharpen, setUpscaleSharpen] = useState(PREFS.upscaleSharpen ?? 40);
 
   // Image mode: mirror of the selected image's masks. Video mode: manual masks only
   // (auto face masks come from faceTrack, per frame).
   const [masks, setMasks] = useState<Mask[]>([]);
-  const [maskStyle, setMaskStyle] = useState<MaskStyle>(DEFAULT_MASK_STYLE);
-  const [detectSettings, setDetectSettings] = useState<DetectSettings>(DEFAULT_DETECT_SETTINGS);
+  const [maskStyle, setMaskStyle] = useState<MaskStyle>(PREFS.maskStyle ?? DEFAULT_MASK_STYLE);
+  const [detectSettings, setDetectSettings] = useState<DetectSettings>(PREFS.detectSettings ?? DEFAULT_DETECT_SETTINGS);
   // Face blur on/off (auto-detection and export scanning). Independent of the active tool.
   const [maskingMode, setMaskingMode] = useState(true);
   const [tool, setTool] = useState<Tool>("mask");
-  const [activePreset, setActivePreset] = useState<string | null>("bc");
+  const [activePreset, setActivePreset] = useState<string | null>(PREFS.activePreset !== undefined ? PREFS.activePreset : "bc");
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelError, setModelError] = useState(false);
   const [autoMaskEnabled, setAutoMaskEnabled] = useState(true);
@@ -204,13 +244,22 @@ export default function ObscuraX() {
     setImgReady(false);
   }, [selectedIdx, images[selectedIdx]?.src, mode]);
 
+  // Stable id of the open video, for the saved session; and a saved video's
+  // masks and face track to put back once it loads.
+  const videoId = useRef<string | null>(null);
+  const restoreVideo = useRef<SavedVideo | null>(null);
   useEffect(() => {
     if (!videoFile) return;
     const url = URL.createObjectURL(videoFile);
-    setVideoSrc(url); setVideoReady(false);
-    // New video: drop the previous video's masks and face track, cancel any scan.
+    setVideoSrc(url); setVideoReady(false); setAudioRouted(false);
+    // New video: drop the previous video's masks and face track (or restore the
+    // saved ones), and cancel any scan.
     scanToken.current++;
-    setMasks([]); setFaceTrack([]); setTrackInfo([]); setHiddenTracks([]); setTrackStatus("idle"); setScan(null);
+    const r = restoreVideo.current;
+    restoreVideo.current = null;
+    setMasks(r?.masks ?? []); setFaceTrack(r?.faceTrack ?? []); setTrackInfo(r?.trackInfo ?? []); setHiddenTracks(r?.hiddenTracks ?? []);
+    setTrackStatus(r && (r.trackStatus === "ready" || r.trackStatus === "stale") ? r.trackStatus : "idle");
+    setScan(null);
     return () => URL.revokeObjectURL(url);
   }, [videoFile]);
 
@@ -406,6 +455,7 @@ export default function ObscuraX() {
   };
 
   const clearAllMasks = () => {
+    markEdit();
     if (mode === "image") updateMasks(() => []);
     else { scanToken.current++; setScan(null); setMasks([]); setFaceTrack([]); setTrackInfo([]); setHiddenTracks([]); setTrackStatus("ready"); }
   };
@@ -430,8 +480,24 @@ export default function ObscuraX() {
     canvasRef.current.width = Math.round(w * s); canvasRef.current.height = Math.round(h * s);
     vidElRef.current = el;
     setCanvasDims({ w, h });
-    setVideoDur(el.duration);
-    setVideoReady(true);
+    const ready = (dur: number) => { setVideoDur(dur); setVideoReady(true); };
+    if (Number.isFinite(el.duration)) { ready(el.duration); return; }
+    // WebM recorded in a browser (MediaRecorder, including this app's own exports)
+    // has no duration in its header. Seeking far past the end makes the browser
+    // work it out; then go back to the start.
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      el.removeEventListener("durationchange", onDur);
+      clearTimeout(timer);
+      el.currentTime = 0;
+      ready(Number.isFinite(el.duration) ? el.duration : 0);
+    };
+    const onDur = () => { if (Number.isFinite(el.duration)) settle(); };
+    const timer = setTimeout(settle, 5000);
+    el.addEventListener("durationchange", onDur);
+    el.currentTime = 1e101;
   }, []);
 
   const ingestFiles = useCallback(async (fileList: FileList | File[]) => {
@@ -439,7 +505,8 @@ export default function ObscuraX() {
     const incoming = Array.from(fileList);
     const newVideos = incoming.filter(f => f.type.startsWith("video"));
     const newImages = incoming.filter(f => f.type.startsWith("image"));
-    if (newVideos.length > 0) { setVideoFile(newVideos[0]); setMode("video"); setImages([]); return; }
+    setSavedSession(null);
+    if (newVideos.length > 0) { videoId.current = newId(); setVideoFile(newVideos[0]); setMode("video"); setImages([]); return; }
     if (newImages.length === 0) { setFileError("That file type isn't supported. Add JPG, PNG, GIF, MP4 or WebM files."); return; }
     setMode("image");
     const combined = [...images, ...newImages].slice(0, MAX_FILES);
@@ -450,7 +517,7 @@ export default function ObscuraX() {
         if ("src" in item) return item as ImageEntry;
         const file = item as File;
         const { w, h } = await detectImageResolution(file);
-        return { file, src: URL.createObjectURL(file), w, h, masks: [] };
+        return { id: newId(), file, src: URL.createObjectURL(file), w, h, masks: [] };
       })
     );
     setImages(entries); setSelectedIdx(0);
@@ -511,6 +578,7 @@ export default function ObscuraX() {
     const id = drawingId.current;
     dragging.current = false; maskStart.current = null; drawingId.current = null;
     if (!id) return;
+    markEdit();
     setSelectedMaskId(id);
     // Normalise negative sizes from dragging up/left; drop accidental clicks.
     updateMasks(prev => prev.flatMap(m => {
@@ -651,12 +719,22 @@ export default function ObscuraX() {
   const exportSingleImage = async (): Promise<boolean> => {
     const entry = images[selectedIdx], imgEl = imgElRef.current;
     if (!entry || !imgEl) return false;
+    const autoScan = maskingMode && autoMaskEnabled && !entry.scanned;
+    if (autoScan && !modelsLoaded) { setFileError(MODEL_MISSING_MSG); return false; }
     setFileError("");
-    setBulkProgress({ done: 0, total: 1 }); setExportMsg(upscaleFactor > 1 ? "Upscaling…" : "Rendering…");
+    setBulkProgress({ done: 0, total: 1 }); setExportMsg(autoScan ? "Finding faces…" : upscaleFactor > 1 ? "Upscaling…" : "Rendering…");
     try {
       await nextFrame();
+      // Faces must be found before saving, even if the image was just changed.
+      let entryMasks = masks;
+      if (autoScan) {
+        const autos = facesToMasks(await detectFaces(imgEl, detectOpts));
+        entryMasks = mergeAutoMasks(entry.masks, autos);
+        setAutoMasks(entry.src, autos);
+        if (upscaleFactor > 1) { setExportMsg("Upscaling…"); await nextFrame(); }
+      }
       const isPng = entry.file.type === "image/png";
-      const out = renderForExport(imgEl, masks);
+      const out = renderForExport(imgEl, entryMasks);
       const blob = await canvasBlob(out, isPng ? "image/png" : "image/jpeg");
       out.width = 0;
       if (!blob) throw new Error("Canvas could not be encoded");
@@ -714,38 +792,277 @@ export default function ObscuraX() {
     return true;
   };
 
+  // ── Video soundtrack ──
+  // The recording is taken from the canvas, which has no sound. The video's
+  // audio is routed through Web Audio: to the speakers (following the mute
+  // button) and to a stream the recorder adds as the export's audio track.
+  // A media element can be connected only once, so this is set up on the first
+  // export and kept for that video.
+  const audioRef = useRef<{ el: HTMLVideoElement; ctx: AudioContext; src: MediaElementAudioSourceNode; gain: GainNode; dest: MediaStreamAudioDestinationNode } | null>(null);
+  const routeAudio = (vid: HTMLVideoElement) => {
+    const cur = audioRef.current;
+    if (cur?.el === vid) { cur.ctx.resume().catch(() => {}); return cur; }
+    const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AC) return null;
+    try {
+      const ctx = cur?.ctx ?? new AC();
+      cur?.src.disconnect();
+      ctx.resume().catch(() => {});
+      const src = ctx.createMediaElementSource(vid);
+      const gain = ctx.createGain();
+      gain.gain.value = videoMuted ? 0 : 1;
+      src.connect(gain).connect(ctx.destination);
+      const dest = ctx.createMediaStreamDestination();
+      src.connect(dest);
+      // Muting the element would silence the recording too; the gain mutes the speakers instead.
+      vid.muted = false;
+      audioRef.current = { el: vid, ctx, src, gain, dest };
+      setAudioRouted(true);
+      return audioRef.current;
+    } catch (err) {
+      console.warn("ObscuraX: the video's sound can't be recorded:", err);
+      return null;
+    }
+  };
+  useEffect(() => {
+    const a = audioRef.current;
+    if (a && a.el === vidElRef.current) a.gain.gain.value = videoMuted ? 0 : 1;
+  }, [videoMuted, audioRouted]);
+
+  const recorderRef = useRef<{ recorder: MediaRecorder; cancelled: boolean } | null>(null);
+  const cancelVideoExport = () => {
+    const r = recorderRef.current;
+    if (!r) return;
+    r.cancelled = true;
+    vidElRef.current?.pause();
+    if (r.recorder.state !== "inactive") r.recorder.stop();
+  };
+
   const exportVideo = async () => {
     const cvs = canvasRef.current, vid = vidElRef.current;
     if (!cvs || !vid) return;
+    // Connect the soundtrack now, while the click still counts as a user gesture
+    // (browsers only start audio from one).
+    const audio = routeAudio(vid);
     if (maskingMode && autoMaskEnabled) {
       if (!modelsLoaded) { setFileError(MODEL_MISSING_MSG); return; }
       // Never export with a missing or out-of-date face track.
       if (trackStatus !== "ready" && !(await scanVideo())) return;
     }
-    const type = recordType();
+    const audioTrack = audio?.dest.stream.getAudioTracks()[0];
+    const type = recordType(!!audioTrack) ?? recordType(false);
     if (!type || typeof cvs.captureStream !== "function") {
       setFileError("This browser can't record video. Try Chrome, Edge, Firefox or Safari 14.1 or later.");
       return;
     }
     const stream = cvs.captureStream(60);
-    const recorder = new MediaRecorder(stream, { mimeType: type.mime, videoBitsPerSecond: 5000000 });
+    if (audioTrack && type.audio) stream.addTrack(audioTrack);
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(stream, { mimeType: type.mime, videoBitsPerSecond: 5000000, audioBitsPerSecond: 128000 });
+    } catch (err) {
+      console.error("ObscuraX: recorder failed:", err);
+      setFileError("This browser couldn't start recording. Try again, or use another browser.");
+      return;
+    }
+    const job = { recorder, cancelled: false };
+    recorderRef.current = job;
     const chunks: Blob[] = [];
+    const onProg = () => setExpPct(vid.duration ? Math.round((vid.currentTime / vid.duration) * 100) : 0);
     recorder.ondataavailable = (e: BlobEvent) => { if (e.data.size > 0) chunks.push(e.data); };
     recorder.onstop = () => {
+      vid.removeEventListener("timeupdate", onProg);
+      vid.loop = true;
+      recorderRef.current = null;
+      setExporting(false); setExpPct(0); setVideoPaused(true);
+      if (job.cancelled) { showToast("Export cancelled"); return; }
       const blob = new Blob(chunks, { type: type.mime.split(";")[0] });
       const file = downloadBlob(blob, `${exportPrefix}video_${Date.now()}.${type.ext}`);
-      setExporting(false); setExpPct(0); showToast("Video downloaded", file);
-      if (vidElRef.current) vidElRef.current.playbackRate = 1.0;
+      showToast(audioTrack && type.audio ? "Video downloaded" : "Video downloaded (without sound)", file);
     };
-    // Phones can't render masks fast enough at 4× speed; they record in real time.
-    vid.currentTime = 0; vid.playbackRate = isTouch ? 1.0 : 4.0;
-    setExporting(true); setVideoPaused(false); recorder.start(); vid.play();
-    const onProg = () => setExpPct(vid.duration ? Math.round((vid.currentTime / vid.duration) * 100) : 0);
+
+    // Recorded in real time: the recorder timestamps frames by the clock, so a
+    // faster playback rate would make the saved video play too fast (and the
+    // sound would be sped up). Looping is off so "ended" fires.
+    setExporting(true); setExpPct(0);
+    vid.pause(); setVideoPaused(true);
+    vid.loop = false; vid.playbackRate = 1;
+    await seekVideo(vid, 0);
+    if (job.cancelled) return;
     vid.addEventListener("timeupdate", onProg);
-    vid.addEventListener("ended", () => { recorder.stop(); vid.removeEventListener("timeupdate", onProg); }, { once: true });
+    vid.addEventListener("ended", () => { if (recorder.state !== "inactive") recorder.stop(); }, { once: true });
+    recorder.start(1000);
+    try {
+      await vid.play();
+    } catch {
+      // Some browsers won't start unmuted playback without a fresh tap: record silently instead.
+      vid.muted = true;
+      await vid.play().catch(() => {});
+    }
+    setVideoPaused(false);
   };
 
   const activeImg = mode === "image" && images.length > 0 ? images[selectedIdx] : null;
+
+  // ── Undo / redo ─────────────────────────────────────────────────────────────
+  // Snapshots cover the user's edits: watermark, filter, mask style, drawn
+  // areas, and which faces are turned off. Face detection results are not
+  // part of history, so undo can never bring back an unblurred face that
+  // detection found; it only restores the user's own on/off choices.
+  const history = useHistory<EditSnapshot>();
+  const takeSnapshot = (): EditSnapshot => ({
+    wm: { wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, activePreset, wmFilter, wmBlur },
+    maskStyle,
+    images: mode === "image" ? Object.fromEntries(images.map(img => [img.id ?? img.src, {
+      drawn: img.masks.filter(m => !m.isAuto),
+      off: img.masks.filter(m => m.isAuto && m.off).map(({ x, y, w, h }) => ({ x, y, w, h })),
+      faces: img.masks.filter(m => m.isAuto).length,
+    }])) : {},
+    video: mode === "video" ? { drawn: masks, hidden: [...hiddenTracks].sort((a, b) => a - b), tracked: faceTrack.length > 0 } : null,
+  });
+  const restoreSnapshot = (snap: EditSnapshot) => {
+    const w = snap.wm;
+    setWmType(w.wmType as typeof WM[keyof typeof WM]); setWmText(w.wmText); setWmLink(w.wmLink); setWmColor(w.wmColor); setWmFont(w.wmFont);
+    setWmSize(w.wmSize); setWmOpacity(w.wmOpacity); setWmBold(w.wmBold); setWmShadow(w.wmShadow); setWmPos(w.wmPos);
+    setActivePreset(w.activePreset); setWmFilter(w.wmFilter); setWmBlur(w.wmBlur);
+    setMaskStyle(snap.maskStyle);
+    if (mode === "image") {
+      setImages(prev => prev.map(img => {
+        const autos = img.masks.filter(m => m.isAuto);
+        // An image missing from the snapshot was added after it: back to no edits.
+        const e = snap.images[img.id ?? img.src] ?? { drawn: [], off: [], faces: autos.length };
+        if (!autos.length && e.faces > 0) {
+          // Undoing "Clear all masks": find the faces again. The turned-off faces
+          // go back as placeholders so detection keeps them off (mergeAutoMasks).
+          const offs: Mask[] = e.off.map((b, i) => ({ id: `off-${i}`, ...b, type: "blur", isAuto: true, off: true }));
+          return { ...img, scanned: false, masks: [...offs, ...e.drawn] };
+        }
+        return { ...img, masks: [...autos.map(a => ({ ...a, off: e.off.some(o => sameFace(a, o)) })), ...e.drawn] };
+      }));
+    } else if (mode === "video" && snap.video) {
+      setMasks(snap.video.drawn); setHiddenTracks(snap.video.hidden);
+      // Undoing "Clear all masks": the face track isn't kept in history, so scan again.
+      if (snap.video.tracked && !faceTrack.length && trackStatus !== "scanning") setTrackStatus("idle");
+    }
+    setSelectedMaskId(null);
+  };
+  const snapRef = useRef(takeSnapshot);
+  useEffect(() => { snapRef.current = takeSnapshot; });
+
+  // New media starts a fresh history.
+  const historyKey = `${mode}|${videoSrc ?? ""}`;
+  useEffect(() => { history.reset(snapRef.current()); }, [historyKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Settings (sliders, text) are recorded once they settle, so one drag is one step.
+  const settingsKey = JSON.stringify([wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, activePreset, wmFilter, wmBlur, maskStyle]);
+  useEffect(() => {
+    const t = setTimeout(() => history.commit(snapRef.current()), 400);
+    return () => clearTimeout(t);
+  }, [settingsKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Mask edits (draw, delete, turn a face on/off, clear) are recorded right after they render.
+  const [editTick, setEditTick] = useState(0);
+  const markEdit = () => setEditTick(t => t + 1);
+  useEffect(() => { if (editTick) history.commit(snapRef.current()); }, [editTick]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const doUndo = () => {
+    // Record a change still waiting for its debounce first, so it can be redone.
+    history.commit(takeSnapshot());
+    const snap = history.undo();
+    if (snap) restoreSnapshot(snap);
+  };
+  const doRedo = () => {
+    const snap = history.redo();
+    if (snap) restoreSnapshot(snap);
+  };
+
+  // ── Keeping work between visits ─────────────────────────────────────────────
+  // Preferences are saved as they change; the session (media, masks, face
+  // track) is saved a moment after each change and offered back next time.
+  const prefs: Prefs = {
+    wmType, wmText, wmLink, wmColor, wmFont, wmSize, wmOpacity, wmBold, wmShadow, wmPos, activePreset, wmFilter, wmBlur,
+    exportPrefix, maskStyle, detectSettings, upscaleFactor, upscaleSharpen,
+  };
+  const prefsJson = JSON.stringify(prefs);
+  const prefsRef = useRef(prefs);
+  useEffect(() => { prefsRef.current = prefs; });
+  useEffect(() => {
+    const t = setTimeout(() => savePrefs(prefsRef.current), 300);
+    return () => clearTimeout(t);
+  }, [prefsJson]);
+  useEffect(() => {
+    // localStorage is synchronous, so the last change survives closing the tab.
+    const flush = () => savePrefs(prefsRef.current);
+    window.addEventListener("pagehide", flush);
+    return () => window.removeEventListener("pagehide", flush);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadSession().then(s => { if (!cancelled) { setSavedSession(s); setSessionChecked(true); } });
+    loadLogo().then(f => { if (!cancelled && f) setWmImgFile(cur => cur ?? f); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const buildSession = (): { session: Session; files: { id: string; file: File }[] } | null => {
+    if (mode === "image" && images.length) {
+      return {
+        session: {
+          v: 1, savedAt: Date.now(), mode: "image", selectedIdx, video: null,
+          images: images.map(img => ({ id: img.id!, w: img.w, h: img.h, masks: img.masks, scanned: img.scanned })),
+        },
+        files: images.map(img => ({ id: img.id!, file: img.file })),
+      };
+    }
+    if (mode === "video" && videoFile && videoId.current && videoFile.size <= MAX_SAVED_VIDEO_BYTES) {
+      return {
+        session: {
+          v: 1, savedAt: Date.now(), mode: "video", images: [], selectedIdx: 0,
+          video: { id: videoId.current, masks, faceTrack, trackInfo, hiddenTracks, trackStatus },
+        },
+        files: [{ id: videoId.current, file: videoFile }],
+      };
+    }
+    return null;
+  };
+  const saveNow = async () => {
+    if (!sessionChecked || savedSession) return; // don't overwrite a session still on offer
+    const b = buildSession();
+    if (b) await saveSession(b.session, b.files);
+    else await clearSession();
+  };
+  const saveRef = useRef(saveNow);
+  useEffect(() => { saveRef.current = saveNow; });
+  useEffect(() => {
+    if (!sessionChecked || trackStatus === "scanning") return;
+    const t = setTimeout(() => { saveRef.current(); }, 800);
+    return () => clearTimeout(t);
+  }, [sessionChecked, savedSession, mode, images, selectedIdx, videoFile, masks, faceTrack, trackInfo, hiddenTracks, trackStatus]);
+
+  const continueSession = () => {
+    const s = savedSession;
+    if (!s) return;
+    const { session, files } = s;
+    setSavedSession(null); setFileError("");
+    if (session.mode === "image") {
+      const entries: ImageEntry[] = session.images.flatMap(im => {
+        const file = files.get(im.id);
+        return file ? [{ id: im.id, file, src: URL.createObjectURL(file), w: im.w, h: im.h, masks: im.masks, scanned: im.scanned }] : [];
+      });
+      if (!entries.length) return;
+      setImages(entries); setSelectedIdx(Math.min(session.selectedIdx, entries.length - 1)); setMode("image");
+    } else if (session.video) {
+      const file = files.get(session.video.id);
+      if (!file) return;
+      videoId.current = session.video.id;
+      restoreVideo.current = session.video;
+      setVideoFile(file); setImages([]); setMode("video");
+    }
+  };
+  const discardSession = () => { setSavedSession(null); clearSession(); };
+  const sessionSummary = savedSession && (savedSession.session.mode === "video"
+    ? savedSession.files.values().next().value?.name ?? "A video"
+    : plural(savedSession.files.size, "image"));
 
   // ── View ────────────────────────────────────────────────────────────────────
   const { mode: themeMode, cycle: cycleTheme } = useTheme();
@@ -794,15 +1111,26 @@ export default function ObscuraX() {
   useEffect(() => { setZoom(null); }, [activeSrc, videoSrc]);
   const zoomBy = useCallback((f: number) => setZoom(z => Math.min(8, Math.max(0.05, (z ?? shownScale) * f))), [shownScale]);
 
+  // Latest undo / redo for the key handler.
+  const undoKeys = useRef({ undo: doUndo, redo: doRedo });
+  useEffect(() => { undoKeys.current = { undo: doUndo, redo: doRedo }; });
+
   // Latest selection actions for the key handler, without re-binding it every render.
   const selectionKeys = useRef<{ remove?: () => void; deselect?: () => void }>({});
 
-  // Shortcuts: F / W / A pick a tool; Ctrl/⌘ + = / − / 0 zoom; Delete / Esc act on the selected mask.
+  // Shortcuts: F / W / A pick a tool; Ctrl/⌘ + Z undo, Ctrl/⌘ + Shift + Z or Ctrl + Y redo;
+  // Ctrl/⌘ + = / − / 0 zoom; Delete / Esc act on the selected mask.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (exportOpen) return;
       if (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable]")) return;
       const mod = e.metaKey || e.ctrlKey;
+      const k = e.key.toLowerCase();
+      if (mod && !e.altKey && (k === "z" || k === "y")) {
+        e.preventDefault();
+        if (k === "y" || e.shiftKey) undoKeys.current.redo(); else undoKeys.current.undo();
+        return;
+      }
       if ((e.key === "Delete" || e.key === "Backspace") && selectionKeys.current.remove) { e.preventDefault(); selectionKeys.current.remove(); return; }
       if (e.key === "Escape" && selectionKeys.current.deselect) { selectionKeys.current.deselect(); return; }
       if (mod && (e.key === "=" || e.key === "+")) { e.preventDefault(); zoomBy(1.25); }
@@ -855,11 +1183,13 @@ export default function ObscuraX() {
   const selectedItem = selectedMaskId ? itemById.get(selectedMaskId) ?? null : null;
 
   const setAreaOff = (id: string, off: boolean) => {
+    markEdit();
     const tid = trackIdOf(id);
     if (tid != null) setHiddenTracks(h => (off ? [...new Set([...h, tid])] : h.filter(x => x !== tid)));
     else updateMasks(prev => prev.map(m => (m.id === id ? { ...m, off } : m)));
   };
   const deleteArea = (id: string) => {
+    markEdit();
     updateMasks(prev => prev.filter(m => m.id !== id));
     setSelectedMaskId(sel => (sel === id ? null : sel));
   };
@@ -922,7 +1252,7 @@ export default function ObscuraX() {
         ? { text: "Finding faces…", spin: true }
         : { text: `${autoFaces < autoTotal ? `${autoFaces} of ${autoTotal} faces` : plural(autoFaces, "face")} covered${drawnMasks ? ` · ${plural(drawnMasks, "drawn area")}` : ""}`, ok: true };
     } else if (trackStatus === "scanning") faceStatus = { text: `Tracking faces… ${scan?.pct ?? 0}%`, spin: true };
-    else if (trackStatus === "ready") faceStatus = { text: faceTrack.length ? `Up to ${plural(peakFaces, "face")} per frame covered` : "Face track cleared", ok: faceTrack.length > 0 };
+    else if (trackStatus === "ready") faceStatus = { text: !faceTrack.length ? "Face track cleared" : peakFaces ? `Up to ${plural(peakFaces, "face")} per frame covered` : "No faces found", ok: faceTrack.length > 0 };
     else faceStatus = { text: trackStatus === "stale" ? "Rescan needed" : "Not scanned yet" };
   }
 
@@ -987,6 +1317,12 @@ export default function ObscuraX() {
         )}
         {activity && <span className="activity" role="status" title={activity}><Spinner /><span className="hide-sm">{activity}</span></span>}
         {mode && (
+          <div className="zoom" role="group" aria-label="History">
+            <button type="button" onClick={doUndo} disabled={!history.canUndo || busy} aria-label="Undo" title="Undo (Ctrl/⌘ + Z)"><Undo2 aria-hidden="true" /></button>
+            <button type="button" onClick={doRedo} disabled={!history.canRedo || busy} aria-label="Redo" title="Redo (Ctrl/⌘ + Shift + Z)"><Redo2 aria-hidden="true" /></button>
+          </div>
+        )}
+        {mode && (
           <div className="zoom" role="group" aria-label="Zoom">
             <button type="button" className="hide-sm" onClick={() => zoomBy(0.8)} aria-label="Zoom out" title="Zoom out (Ctrl/⌘ + −)"><Minus aria-hidden="true" /></button>
             <button type="button" className="pct" onClick={() => setZoom(1)} aria-label="Actual size" title="Actual size">{Math.round((zoom ?? shownScale) * 100)}%</button>
@@ -1004,6 +1340,23 @@ export default function ObscuraX() {
       <div className="stage-wrap">
         <main ref={stageRef} className={`stage${zoom === null ? " fit" : ""}${dropActive ? " over" : ""}`} aria-label="Workspace" {...dropProps}>
           {!mode ? (
+            <div className="start">
+            {savedSession && (
+              <section className="card resume" aria-labelledby="resume-title">
+                <div className="resume-head">
+                  <span className="resume-icon" aria-hidden="true"><History /></span>
+                  <div>
+                    <h2 id="resume-title">Continue where you left off?</h2>
+                    <p className="sub">{sessionSummary} · saved {timeAgo(savedSession.session.savedAt)}</p>
+                  </div>
+                </div>
+                <div className="btn-row">
+                  <button type="button" className="btn primary" onClick={continueSession}>Continue</button>
+                  <button type="button" className="btn" onClick={discardSession}>Start over</button>
+                </div>
+                <p className="hint">Your work is kept only in this browser, on this device.</p>
+              </section>
+            )}
             <button type="button" className="drop lg" onClick={pickFiles}>
               <Upload aria-hidden="true" />
               <span className="t">Open images or a video</span>
@@ -1011,6 +1364,7 @@ export default function ObscuraX() {
                 {isTouch ? "Tap to choose photos or a video" : "Drop files here, or click to choose"}. Up to {MAX_FILES} images, or one video. Files stay on this device, and it works offline.
               </span>
             </button>
+            </div>
           ) : (
             <canvas ref={canvasRef} aria-label={`Preview of ${mediaName}`} data-tool={tool}
               style={zoom === null ? undefined : { width: canvasDims.w * zoom }}
@@ -1061,15 +1415,16 @@ export default function ObscuraX() {
       <footer className="dock" aria-label={mode === "video" ? "Timeline" : "Images"} hidden={!mode}>
         {mode === "video" ? (
           <div className="transport">
-            <button type="button" className="dl-btn" onClick={() => setVideoPaused(!videoPaused)} disabled={!videoReady} aria-label={videoPaused ? "Play" : "Pause"} title={videoPaused ? "Play" : "Pause"}>
+            <button type="button" className="dl-btn" onClick={() => setVideoPaused(!videoPaused)} disabled={!videoReady || exporting} aria-label={videoPaused ? "Play" : "Pause"} title={videoPaused ? "Play" : "Pause"}>
               {videoPaused ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}
             </button>
             <button type="button" className="dl-btn" onClick={() => setVideoMuted(!videoMuted)} aria-label={videoMuted ? "Turn sound on" : "Mute"} title={videoMuted ? "Turn sound on" : "Mute"}>
               {videoMuted ? <VolumeX aria-hidden="true" /> : <Volume2 aria-hidden="true" />}
             </button>
-            <input type="range" aria-label="Position in video" min={0} max={videoDur || 100} step={0.01} value={videoTime}
+            <input type="range" aria-label="Position in video" min={0} max={videoDur || 100} step={0.01} value={videoTime} disabled={exporting}
               onChange={e => { const t = Number(e.target.value); if (vidElRef.current) vidElRef.current.currentTime = t; setVideoTime(t); }} />
             <span className="time">{fmtTime(videoTime)} / {fmtTime(videoDur)}</span>
+            {exporting && <button type="button" className="btn sm" onClick={cancelVideoExport}><Square aria-hidden="true" />Stop</button>}
           </div>
         ) : (
           <div className="strip" role="list">
@@ -1336,6 +1691,7 @@ export default function ObscuraX() {
         <Field label="File name prefix" htmlFor="exp-prefix"><TextInput id="exp-prefix" value={exportPrefix} onChange={setExportPrefix} placeholder="watermarked_" /></Field>
         {faceBlurOn && exportAll && unscannedCount > 0 && <p className="hint">{plural(unscannedCount, "image")} {unscannedCount === 1 ? "hasn't" : "haven't"} been checked for faces yet. {unscannedCount === 1 ? "It's" : "They're"} checked before saving.</p>}
         {faceBlurOn && mode === "video" && trackStatus !== "ready" && <p className="hint">The video is scanned for faces before recording.</p>}
+        {mode === "video" && <p className="hint">The video plays through once while it's recorded, with its sound ({fmtTime(videoDur)}). Keep this tab open until it finishes.</p>}
         {bulkProgress && <Progress label={exportMsg || "Exporting…"} meta={bulkProgress.total > 1 ? `${bulkProgress.done} of ${bulkProgress.total}` : undefined} pct={(bulkProgress.done / bulkProgress.total) * 100} />}
         {fileError && <div className="notice err" role="alert">{fileError}</div>}
         <div className="modal-foot">
@@ -1354,7 +1710,7 @@ export default function ObscuraX() {
       </Modal>
 
       <input id="__mi" type="file" accept="image/*,video/*" multiple hidden onChange={e => { if (e.target.files) ingestFiles(e.target.files); e.target.value = ""; }} />
-      <input id="__wi" type="file" accept="image/*" hidden onChange={e => e.target.files?.[0] && setWmImgFile(e.target.files[0])} />
+      <input id="__wi" type="file" accept="image/*" hidden onChange={e => { const f = e.target.files?.[0]; if (f) { setWmImgFile(f); saveLogo(f); } e.target.value = ""; }} />
       <input id="__ic" type="file" accept=".json" hidden onChange={e => { if (e.target.files?.[0]) importConfigJson(e.target.files[0]); e.target.value = ""; }} />
 
       {activeImg && (
@@ -1368,15 +1724,15 @@ export default function ObscuraX() {
           onLoadedMetadata={e => onVideoLoad(e.target as HTMLVideoElement)}
           onLoadedData={() => drawRef.current()}
           onSeeked={() => drawRef.current()}
-          autoPlay loop muted={videoMuted} playsInline
+          autoPlay loop muted={audioRouted ? false : videoMuted} playsInline
           style={{ position: "fixed", top: -9999, left: -9999, opacity: 0, pointerEvents: "none", width: 1, height: 1 }}
         />
       )}
 
       {pwa.updateReady ? (
         <div className="toast has-action" role="status">
-          <span>A new version is ready. Reloading clears the current edit.</span>
-          <button type="button" className="btn sm" onClick={applyUpdate}><RefreshCw aria-hidden="true" />Reload</button>
+          <span>A new version is ready.{mode && !buildSession() ? " Reloading clears this video: it's too large to keep." : " Your work is kept."}</span>
+          <button type="button" className="btn sm" onClick={async () => { await saveRef.current(); applyUpdate(); }}><RefreshCw aria-hidden="true" />Reload</button>
           <button type="button" className="icon-x" onClick={dismissUpdate} aria-label="Later" title="Later"><X aria-hidden="true" /></button>
         </div>
       ) : toastMsg && (
