@@ -9,6 +9,9 @@ import { join, relative, resolve, sep } from 'node:path'
  * built file (app, fonts, face model, icons) so ObscuraX runs with no network.
  * The cache name is a hash of all file contents, so any change ships as an update.
  */
+/** The NudeNet model and the onnxruntime WebAssembly files: fetched only when nudity blur is used. */
+const ON_DEMAND = /(^|\/)(nudenet-320n\.onnx|ort-wasm[^/]*\.(wasm|mjs))$/
+
 function offlineServiceWorker() {
   let outDir
   return {
@@ -27,12 +30,16 @@ function offlineServiceWorker() {
       const hash = createHash('sha256').update(template)
       for (const f of files) hash.update(f).update(readFileSync(join(outDir, f)))
       const version = hash.digest('hex').slice(0, 12)
+      // Large files only needed by an optional feature (nudity detection) are
+      // cached on first use instead of on install, so first visits stay small.
+      const onDemand = files.filter(f => ON_DEMAND.test(f))
       // './' is the page itself; index.html is served there by any static host.
-      const assets = ['./', ...files.filter(f => f !== 'index.html')]
+      const assets = ['./', ...files.filter(f => f !== 'index.html' && !ON_DEMAND.test(f))]
       writeFileSync(join(outDir, 'sw.js'), template
         .replace('__VERSION__', version)
-        .replace('__ASSETS__', JSON.stringify(assets)))
-      console.log(`\n  offline: sw.js precaches ${assets.length} files (version ${version})`)
+        .replace('__ASSETS__', JSON.stringify(assets))
+        .replace('__ON_DEMAND__', JSON.stringify(onDemand)))
+      console.log(`\n  offline: sw.js precaches ${assets.length} files, ${onDemand.length} more on first use (version ${version})`)
     },
   }
 }

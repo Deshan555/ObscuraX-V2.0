@@ -15,6 +15,7 @@
     "face-api.js": "^0.22.2",
     "jszip": "^3.10.1",
     "lucide-react": "^1.79.0",
+    "onnxruntime-web": "^1.31.1",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },

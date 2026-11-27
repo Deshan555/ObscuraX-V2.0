@@ -4,7 +4,12 @@
 
 const VERSION = "__VERSION__";
 const ASSETS = __ASSETS__;
+/** Large optional files (nudity detector): cached the first time they're used. */
+const ON_DEMAND = __ON_DEMAND__;
 const CACHE = `obscurax-${VERSION}`;
+// Kept across versions, so an update doesn't make people download 27 MB again
+// (or lose the detector while offline). Entries this version doesn't use are pruned.
+const ON_DEMAND_CACHE = "obscurax-on-demand";
 const scoped = path => new URL(path, self.registration.scope).href;
 // ignoreVary: module scripts are requested with an Origin header that the
 // precache requests lack; hosts that send `Vary: Origin` would otherwise miss.
@@ -23,7 +28,10 @@ self.addEventListener("message", event => {
 
 self.addEventListener("activate", event => {
   event.waitUntil((async () => {
-    for (const key of await caches.keys()) if (key.startsWith("obscurax-") && key !== CACHE) await caches.delete(key);
+    for (const key of await caches.keys()) if (key.startsWith("obscurax-") && key !== CACHE && key !== ON_DEMAND_CACHE) await caches.delete(key);
+    const wanted = new Set(ON_DEMAND.map(scoped));
+    const od = await caches.open(ON_DEMAND_CACHE);
+    for (const req of await od.keys()) if (!wanted.has(req.url)) await od.delete(req);
     await self.clients.claim();
   })());
 });
@@ -40,6 +48,19 @@ self.addEventListener("fetch", event => {
       const cached = await caches.match(scoped("./"), MATCH);
       if (cached) return cached;
       return fetch(req);
+    })());
+    return;
+  }
+
+  // On-demand files: from their own cache, downloaded and kept on first use.
+  if (ON_DEMAND.some(p => scoped(p) === url.origin + url.pathname)) {
+    event.respondWith((async () => {
+      const od = await caches.open(ON_DEMAND_CACHE);
+      const hit = await od.match(req, { ignoreVary: true, ignoreSearch: true });
+      if (hit) return hit;
+      const res = await fetch(req);
+      if (res.ok && res.type === "basic") await od.put(req, res.clone()).catch(() => {});
+      return res;
     })());
     return;
   }

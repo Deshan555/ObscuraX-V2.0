@@ -114,10 +114,10 @@ export function maskRect(m: Mask, style: MaskStyle) {
   if (w < 0) { x += w; w = -w; }
   if (h < 0) { y += h; h = -h; }
   if (m.isAuto && style.padding > 0) {
-    // Detector boxes run brow-to-chin; pad more on top to cover hair.
     const p = style.padding / 100;
     x -= w * p; w *= 1 + 2 * p;
-    y -= h * p * 1.4; h *= 1 + 2 * p;
+    if (m.part) { y -= h * p; h *= 1 + 2 * p; } // intimate areas: even margin all round
+    else { y -= h * p * 1.4; h *= 1 + 2 * p; } // face boxes run brow-to-chin; more on top for hair
   }
   return { x, y, w, h };
 }

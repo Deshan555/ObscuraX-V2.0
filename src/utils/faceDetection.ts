@@ -122,11 +122,15 @@ function mergeOverlapping(boxes: FaceBox[]): FaceBox[] {
 }
 
 let idSeq = 0;
-/** Video boxes keep their track id (`track-<id>`) so a face is the same item in every frame. */
+/**
+ * Video boxes keep their track id (`track-<id>`) so a face is the same item in every frame.
+ * Intimate-area boxes (from bodyDetection.ts) keep their class in `part`.
+ */
 export function facesToMasks(boxes: FaceBox[]): Mask[] {
   return boxes.map(b => ({
     id: b.id != null ? `track-${b.id}` : `auto-${++idSeq}`,
     x: b.x, y: b.y, w: b.w, h: b.h, type: "blur", isAuto: true, score: b.score,
+    ...(b.part ? { part: b.part } : {}),
   }));
 }
 
@@ -155,8 +159,10 @@ function matchBoxes(a: FaceBox[], b: FaceBox[], reach = 1) {
   a.forEach((ba, i) => b.forEach((bb, j) => {
     const ca = center(ba), cb = center(bb);
     const d = Math.hypot(ca.cx - cb.cx, ca.cy - cb.cy);
-    // Linked boxes match only their own track; otherwise match by distance.
-    const ok = ba.id != null && bb.id != null ? ba.id === bb.id : d < Math.max(ba.w, ba.h, bb.w, bb.h) * reach;
+    // Linked boxes match only their own track; otherwise match by distance,
+    // and only the same kind (a face never continues as a body part, or vice versa).
+    const ok = ba.id != null && bb.id != null ? ba.id === bb.id
+      : (ba.part ?? "") === (bb.part ?? "") && d < Math.max(ba.w, ba.h, bb.w, bb.h) * reach;
     if (ok) pairs.push({ i, j, d });
   }));
   pairs.sort((p, q) => p.d - q.d);
@@ -208,8 +214,8 @@ export function boxesAt(track: TrackSample[], t: number): FaceBox[] {
  * Links detections into tracks while a video is scanned: a box near a face
  * seen in the last `maxGap` seconds gets that face's id, otherwise a new one.
  */
-export function createTrackLinker(maxGap = 1) {
-  let next = 1;
+export function createTrackLinker(maxGap = 1, firstId = 1) {
+  let next = firstId;
   const live: { id: number; box: FaceBox; t: number }[] = [];
   return (t: number, boxes: FaceBox[]): { boxes: FaceBox[]; newIds: number[] } => {
     const recent = live.filter(tr => t - tr.t <= maxGap);

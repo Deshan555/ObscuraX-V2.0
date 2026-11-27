@@ -25,6 +25,9 @@ export const PALETTE = ["#ffffff", "#000000", "#e8b86d", "#ff4d4d", "#4d94ff", "
 
 export const MAX_FILES = 20;
 
+/** Public source of this app. Linked in the app because the bundled NudeNet model is AGPL-3.0. */
+export const SOURCE_URL = "https://github.com/Deshan555/ObscuraX-V2.0";
+
 export const FILTERS = [
   { label: "None",      value: "none" },
   { label: "Grayscale", value: "grayscale(100%)" },

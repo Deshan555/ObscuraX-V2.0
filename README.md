@@ -17,6 +17,7 @@ After the first visit it works with no internet connection at all, and it can be
 | **Positioning** | 9-point grid presets + freehand drag on canvas |
 | **Filters** | Grayscale, Sepia, Invert, Blur, Soft blur, Brightness, Contrast, Vintage |
 | **Face Detection** | Automatic face-detection with oval or rectangle masks (blur / pixelate / solid), soft edges, per-face on/off |
+| **Nudity Blur** | Optional automatic blurring of exposed intimate areas (breasts, genitals, buttocks; male chest optional), on-device |
 | **Manual Masking** | Draw custom areas for anything else you want to redact |
 | **Video Support** | Faces are tracked frame to frame; timeline scrubber, mute/unmute; exports keep the sound (WebM, or MP4 on Safari) |
 | **Bulk Export** | Process up to 20 images and download as a single ZIP archive |
@@ -44,6 +45,8 @@ After the first visit it works with no internet connection at all, and it can be
 |---|---|
 | **face-api.js** | In-browser face detection via TensorFlow\.js backend (WebGL) |
 | **SSD-MobileNet v1** | Single-shot face detector (≈ 5.4 MB quantised weights) |
+| **NudeNet 320n** | YOLOv8n nudity detector (12 MB, ONNX), loaded only when nudity blur is on — AGPL-3.0 |
+| **onnxruntime-web** | Runs NudeNet in WebAssembly (single-threaded), served with the app |
 | **Bundled weights** | Served from `public/models/` with the app and cached by the service worker — no CDN, works offline |
 
 ### Media Processing
@@ -190,13 +193,14 @@ watermark-studio/
 │   ├── utils/
 │   │   ├── canvas.ts         # applyWatermark(), applyMasks() — pure canvas logic
 │   │   ├── faceDetection.ts  # Model loading, detection, video face tracking
+│   │   ├── bodyDetection.ts  # NudeNet nudity detection (onnxruntime-web)
 │   │   ├── upscale.ts        # Export upscaling and sharpening
 │   │   ├── session.ts        # Saved preferences and session (localStorage, IndexedDB)
 │   │   └── device.ts         # Per-device canvas limits (phones, iOS Safari)
 │   └── helpers/
 │       └── media.ts          # detectImageResolution() helper
 ├── public/
-│   ├── models/               # SSD-MobileNet v1 face model weights
+│   ├── models/               # Face model weights; NudeNet model + its AGPL-3.0 license
 │   ├── icons/                # App icons (SVG sources + PNG sizes)
 │   └── manifest.webmanifest  # Install metadata
 ├── index.html
@@ -247,6 +251,19 @@ The service worker only runs in the production build (`npm run build` + `npm run
 
 ---
 
+## 🔞 Nudity Blur
+
+Turn on **Blur nudity automatically** in the *Blur* panel to find and cover exposed intimate areas, in photos and videos, the same way faces are covered.
+
+- **What's covered:** choose *Breasts*, *Genitals* (including anus), *Buttocks* and, optionally, *Male chest*. Covered (clothed) areas are ignored.
+- **Sensitivity:** lower thresholds find more; the default (75%) matches NudeNet's own threshold.
+- Each detected area appears in *Blurred areas* as "Breast 1", "Buttocks 1"… with an icon instead of a thumbnail, and can be turned off like a face. Undo, saved sessions and video tracking work the same as for faces.
+- **Model:** [NudeNet](https://github.com/notAI-tech/NudeNet) 320n (YOLOv8n, 320 × 320 input), run through onnxruntime-web in WebAssembly. Pre- and post-processing follow NudeNet's reference implementation. Nothing is uploaded.
+- **Download:** the model (12 MB) and runtime (15 MB) download the first time the option is turned on, then the service worker keeps them for offline use, including across app updates.
+- Detection is a safety net, not a guarantee: check the result before sharing, and draw extra areas where needed.
+
+---
+
 ## ↩️ Undo & Saved Work
 
 - **Undo / redo** covers your own edits: drawing and deleting blur areas, turning faces on or off, clearing masks, and watermark, filter and mask-style changes (a slider drag is one step). Use the arrows in the top bar, or Ctrl/⌘ + Z and Ctrl/⌘ + Shift + Z (Ctrl + Y on Windows).
@@ -271,6 +288,7 @@ On the first visit the service worker downloads and caches everything the app ne
 - **Updates:** a new deploy is downloaded in the background. The app then shows **"A new version is ready"** with a *Reload* button. It never reloads by itself; your work is saved first and offered back after the reload.
 - **Offline indicator:** the top bar shows *Offline* when there's no connection, as a reminder that everything still works.
 - **How it works:** at build time, `vite.config.js` lists every file in `dist/`, hashes their contents into a version, and writes `dist/sw.js` from `src/sw-template.js`. Each new version gets its own cache, and old caches are deleted once it takes over.
+- **Optional large files:** the nudity detector and its WebAssembly runtime aren't downloaded on install. They're cached the first time nudity blur is used, in a separate cache that's kept across versions (files a version no longer uses are pruned).
 
 ---
 
@@ -310,4 +328,8 @@ All media stays on your device. ObscuraX is a **pure client-side application**:
 
 ## 📄 License
 
-MIT © [Deshan](https://github.com/Deshan555)
+ObscuraX's own code is MIT © [Deshan](https://github.com/Deshan555).
+
+The bundled nudity detector, [NudeNet](https://github.com/notAI-tech/NudeNet) (`public/models/nudenet-320n.onnx`), is licensed **AGPL-3.0** (full text in `public/models/NUDENET-LICENSE.txt`). The built app includes it, so distributing or hosting ObscuraX must follow the AGPL-3.0 as well: the complete corresponding source has to be available to its users. This public repository provides that, and the app links to it from the Blur panel. If you fork and host it, keep your source public and update `SOURCE_URL` in `src/constants/config.ts`, or remove the nudity feature.
+
+Other components: face-api.js (MIT), onnxruntime-web (MIT), React (MIT), JSZip (MIT or GPL-3.0), lucide-react (ISC), Poppins font (OFL-1.1).

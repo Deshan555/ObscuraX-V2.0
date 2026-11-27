@@ -45,6 +45,8 @@ export interface Mask {
   off?: boolean;
   /** Detector confidence, 0–1, for auto-detected faces. */
   score?: number;
+  /** Auto-detected intimate area: the NudeNet class. Unset for faces and drawn areas. */
+  part?: string;
   /** @deprecated style now comes from MaskStyle; kept for older callers. */
   blurLevel?: number;
 }
@@ -83,11 +85,15 @@ export interface FaceBox {
   score: number;
   /** Video only: the same person across samples shares an id. */
   id?: number;
+  /** Intimate-area detections: the NudeNet class (faces have none). */
+  part?: string;
 }
 
 /** Video only: one person followed through the video. */
 export interface TrackInfo {
   id: number;
+  /** Intimate-area track: the NudeNet class. Unset for faces. */
+  part?: string;
   thumb: string;
   score: number;
   /** Samples the face appears in. */

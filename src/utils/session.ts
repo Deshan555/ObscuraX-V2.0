@@ -8,6 +8,7 @@
 
 import { DetectSettings, Mask, MaskStyle, TrackInfo, TrackSample } from "../types";
 import { DEFAULT_DETECT_SETTINGS, DEFAULT_MASK_STYLE } from "../constants/config";
+import { BodyPartChoice, DEFAULT_BODY_PARTS } from "./bodyDetection";
 
 // ── Preferences ───────────────────────────────────────────────────────────────
 
@@ -30,6 +31,9 @@ export interface Prefs {
   detectSettings: DetectSettings;
   upscaleFactor: number;
   upscaleSharpen: number;
+  bodyBlur: boolean;
+  bodyParts: BodyPartChoice;
+  bodyMinScore: number;
 }
 
 const PREFS_KEY = "obscurax.prefs";
@@ -45,8 +49,12 @@ export function loadPrefs(): Partial<Prefs> {
   if (!raw || typeof raw !== "object") return {};
   const out: Partial<Prefs> = {};
   for (const k of ["wmType", "wmText", "wmLink", "wmColor", "wmFont", "wmFilter", "exportPrefix"] as const) if (isStr(raw[k])) out[k] = raw[k] as string;
-  for (const k of ["wmSize", "wmOpacity", "wmBlur", "upscaleFactor", "upscaleSharpen"] as const) if (isNum(raw[k])) out[k] = raw[k] as number;
-  for (const k of ["wmBold", "wmShadow"] as const) if (isBool(raw[k])) out[k] = raw[k] as boolean;
+  for (const k of ["wmSize", "wmOpacity", "wmBlur", "upscaleFactor", "upscaleSharpen", "bodyMinScore"] as const) if (isNum(raw[k])) out[k] = raw[k] as number;
+  for (const k of ["wmBold", "wmShadow", "bodyBlur"] as const) if (isBool(raw[k])) out[k] = raw[k] as boolean;
+  if (raw.bodyParts && typeof raw.bodyParts === "object") {
+    const bp = raw.bodyParts as Record<string, unknown>;
+    out.bodyParts = Object.fromEntries(Object.entries(DEFAULT_BODY_PARTS).map(([k, v]) => [k, isBool(bp[k]) ? bp[k] : v])) as BodyPartChoice;
+  }
   const pos = raw.wmPos as Prefs["wmPos"] | undefined;
   if (pos && isNum(pos.x) && isNum(pos.y)) out.wmPos = { x: pos.x, y: pos.y };
   if (raw.activePreset === null || isStr(raw.activePreset)) out.activePreset = raw.activePreset as string | null;

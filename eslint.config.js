@@ -29,7 +29,7 @@ export default defineConfig([
   {
     // Service worker source; vite.config.js substitutes __ASSETS__ at build time.
     files: ['src/sw-template.js'],
-    languageOptions: { globals: { ...globals.serviceworker, __ASSETS__: 'readonly' } },
+    languageOptions: { globals: { ...globals.serviceworker, __ASSETS__: 'readonly', __ON_DEMAND__: 'readonly' } },
   },
   {
     files: ['vite.config.js'],
