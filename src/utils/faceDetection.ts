@@ -1,7 +1,8 @@
 import * as faceapi from "face-api.js";
 import { FaceBox, Mask, TrackSample } from "../types";
 
-const MODEL_URL = "https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights";
+// Bundled with the app (public/models) so detection works offline.
+const MODEL_URL = `${import.meta.env.BASE_URL}models`;
 
 let modelPromise: Promise<void> | null = null;
 
@@ -29,7 +30,12 @@ function mediaSize(input: DetectInput) {
   return { W: input.width, H: input.height };
 }
 
-let tileCanvas: HTMLCanvasElement | null = null;
+/**
+ * The model sees every input at 512 px, so the full-frame pass loses nothing
+ * from a smaller copy. face-api would otherwise copy the input into a canvas at
+ * full size, which iOS Safari leaves blank past 16.7 MP: no faces found.
+ */
+const FULL_PASS_MAX_SIDE = 2048;
 
 /**
  * Detects faces and returns boxes normalised to 0–1.
@@ -43,16 +49,29 @@ export async function detectFaces(input: DetectInput, opts: DetectOptions): Prom
   if (!W || !H) return [];
   const ssd = new faceapi.SsdMobilenetv1Options({ minConfidence: opts.minConfidence, maxResults: 200 });
 
-  const boxes: FaceBox[] = (await faceapi.detectAllFaces(input, ssd)).map(d => ({
-    x: d.box.x / W, y: d.box.y / H, w: d.box.width / W, h: d.box.height / H, score: d.score,
+  let full: DetectInput = input, fw = W, fh = H;
+  const k = FULL_PASS_MAX_SIDE / Math.max(W, H);
+  if (k < 1) {
+    fw = Math.round(W * k); fh = Math.round(H * k);
+    // A fresh canvas per call: detections can overlap (open image + batch scan).
+    const c = document.createElement("canvas");
+    c.width = fw; c.height = fh;
+    const fctx = c.getContext("2d")!;
+    fctx.imageSmoothingQuality = "high";
+    fctx.drawImage(input, 0, 0, fw, fh);
+    full = c;
+  }
+  const boxes: FaceBox[] = (await faceapi.detectAllFaces(full, ssd)).map(d => ({
+    x: d.box.x / fw, y: d.box.y / fh, w: d.box.width / fw, h: d.box.height / fh, score: d.score,
   }));
+  if (full !== input) (full as HTMLCanvasElement).width = 0;
 
   if (opts.smallFaceBoost && Math.max(W, H) > TILE_THRESHOLD) {
     const n = Math.max(W, H) > 2800 ? 3 : 2;
     // Tiles overlap by ~30% so a face on a seam is fully inside at least one tile.
     const tw = Math.min(W, Math.ceil((W / n) * 1.3));
     const th = Math.min(H, Math.ceil((H / n) * 1.3));
-    tileCanvas ??= document.createElement("canvas");
+    const tileCanvas = document.createElement("canvas");
     tileCanvas.width = tw;
     tileCanvas.height = th;
     const tctx = tileCanvas.getContext("2d")!;

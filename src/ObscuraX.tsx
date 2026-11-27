@@ -6,11 +6,14 @@ import { WM, PRESETS, FONTS, PALETTE, MAX_FILES, FILTERS, DEFAULT_MASK_STYLE, DE
 import { applyWatermark, applyMasks, maskRect, resolveFilter, drawFiltered, filterPreviewCss } from "./utils/canvas";
 import { loadFaceModels, detectFaces, facesToMasks, boxesAt, seekVideo, overlap, cropThumb, createTrackLinker } from "./utils/faceDetection";
 import { upscaleImage, upscaledSize, fitScale, UPSCALE_FACTORS, UPSCALE_MAX_PIXELS } from "./utils/upscale";
+import { scaleToFit, PREVIEW_MAX_PIXELS, CANVAS_MAX_PIXELS, isTouch } from "./utils/device";
+import { usePwa, useOnline, applyUpdate, dismissUpdate, clearOfflineReady } from "./pwa";
 import { detectImageResolution } from "./helpers/media";
 import { Field, TextInput, Select, SwitchRow, Range, Seg, ArmedBtn, Spinner, Progress, Modal } from "./components/common/Atoms";
 import { useTheme } from "./hooks/useTheme";
 import {
   Type, ScanFace, SlidersHorizontal, Eye, EyeOff, Trash2, SquareDashed, Download, Upload, ImagePlus, Plus, Minus, Maximize, Sun, Moon, Monitor, Play, Pause, Volume2, VolumeX, X, Check, FileJson,
+  WifiOff, ChevronDown, Share2, RefreshCw,
   ArrowUpLeft, ArrowUp, ArrowUpRight, ArrowLeft, Dot, ArrowRight, ArrowDownLeft, ArrowDown, ArrowDownRight, LucideIcon,
 } from "lucide-react";
 
@@ -28,7 +31,34 @@ const canvasBlob = (c: HTMLCanvasElement, type: string) => new Promise<Blob | nu
 
 const baseName = (name: string) => name.replace(/\.[^.]+$/, "");
 
+/** Saves a file through the browser's download, and returns it for sharing. */
+function downloadBlob(blob: Blob, name: string): File {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name; a.rel = "noopener";
+  document.body.appendChild(a); a.click(); a.remove();
+  // Some mobile browsers read the blob after click() returns.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  return new File([blob], name, { type: blob.type });
+}
+
+/** Phones and tablets can hand a file to the share sheet ("Save Image" puts it in Photos). */
+const canShareFile = (f: File) => isTouch && typeof navigator.canShare === "function" && navigator.canShare({ files: [f] });
+
+/** Video formats MediaRecorder may support, best first. Safari records MP4 only. */
+const RECORD_TYPES = [
+  { mime: "video/webm;codecs=vp9", ext: "webm" },
+  { mime: "video/webm;codecs=vp8", ext: "webm" },
+  { mime: "video/webm", ext: "webm" },
+  { mime: "video/mp4;codecs=avc1", ext: "mp4" },
+  { mime: "video/mp4", ext: "mp4" },
+];
+const recordType = () => typeof MediaRecorder === "undefined" ? null : RECORD_TYPES.find(t => MediaRecorder.isTypeSupported(t.mime)) ?? null;
+
 const MODEL_MISSING_MSG = "The face model hasn't loaded, so faces can't be found. Wait a moment, or turn off Find faces automatically, before exporting.";
+
+/** Phone layout (see index.css): the panel sits under the image and can be hidden. */
+const isPhoneLayout = () => window.matchMedia("(max-width: 760px)").matches;
 
 type TrackStatus = "idle" | "scanning" | "ready" | "stale";
 
@@ -119,12 +149,21 @@ export default function ObscuraX() {
   const [exportMsg, setExportMsg] = useState("");
   const [expPct, setExpPct] = useState(0);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
+  // A just-exported file the share sheet can take (phones: save to Photos, send to an app).
+  const [shareFile, setShareFile] = useState<File | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
-  const showToast = useCallback((msg: string) => {
+  const showToast = useCallback((msg: string, file?: File) => {
     setToastMsg(msg);
+    setShareFile(file && canShareFile(file) ? file : null);
     window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToastMsg(null), 2600);
+    toastTimer.current = window.setTimeout(() => { setToastMsg(null); setShareFile(null); }, file ? 8000 : 2600);
   }, []);
+  const shareExport = async () => {
+    if (!shareFile) return;
+    try { await navigator.share({ files: [shareFile] }); }
+    catch (err) { if ((err as Error).name !== "AbortError") console.warn("ObscuraX: share failed:", err); }
+    setToastMsg(null); setShareFile(null);
+  };
   const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -134,7 +173,11 @@ export default function ObscuraX() {
   const animRef = useRef<number | null>(null);
   const dragging = useRef(false);
   const maskStart = useRef<{ x: number; y: number } | null>(null);
+  // canvasDims is the media's real size; the canvas itself may be smaller
+  // (previewScale) so phones aren't asked for more than they can draw.
   const [canvasDims, setCanvasDims] = useState({ w: 0, h: 0 });
+  const naturalW = useRef(0);
+  const previewScale = useRef(1);
 
   useEffect(() => {
     loadFaceModels()
@@ -193,7 +236,9 @@ export default function ObscuraX() {
     const ctx = cvs.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, cvs.width, cvs.height);
-    const cfg = wmConfig();
+    // Pixel sizes are in media pixels; scale them to the (possibly smaller) preview canvas.
+    const base = wmConfig(), ps = previewScale.current;
+    const cfg = ps === 1 ? base : { ...base, wmSize: base.wmSize * ps, wmBlur: base.wmBlur * ps };
     drawFiltered(ctx, med, cvs.width, cvs.height, resolveFilter(cfg.wmFilter, cfg.wmBlur, cvs.width, cvs.height));
     let active = masks;
     if (mode === "video" && autoMaskEnabled && faceTrack.length) {
@@ -367,8 +412,10 @@ export default function ObscuraX() {
 
   const onImgLoad = useCallback((el: HTMLImageElement) => {
     if (!el || !canvasRef.current) return;
-    canvasRef.current.width = el.naturalWidth;
-    canvasRef.current.height = el.naturalHeight;
+    const s = scaleToFit(el.naturalWidth, el.naturalHeight, PREVIEW_MAX_PIXELS);
+    previewScale.current = s; naturalW.current = el.naturalWidth;
+    canvasRef.current.width = Math.round(el.naturalWidth * s);
+    canvasRef.current.height = Math.round(el.naturalHeight * s);
     imgElRef.current = el;
     setCanvasDims({ w: el.naturalWidth, h: el.naturalHeight });
     setImgReady(true);
@@ -377,7 +424,10 @@ export default function ObscuraX() {
   const onVideoLoad = useCallback((el: HTMLVideoElement) => {
     if (!el || !canvasRef.current) return;
     const w = el.videoWidth || 1280, h = el.videoHeight || 720;
-    canvasRef.current.width = w; canvasRef.current.height = h;
+    // The recording is taken from this canvas, so it stays full size where the device allows.
+    const s = scaleToFit(w, h, CANVAS_MAX_PIXELS);
+    previewScale.current = s; naturalW.current = w;
+    canvasRef.current.width = Math.round(w * s); canvasRef.current.height = Math.round(h * s);
     vidElRef.current = el;
     setCanvasDims({ w, h });
     setVideoDur(el.duration);
@@ -414,12 +464,10 @@ export default function ObscuraX() {
     if (images.length === 1) { setMode(null); setImgReady(false); }
   };
 
-  const posFromEvent = (e: React.MouseEvent | React.TouchEvent) => {
+  const posFromEvent = (e: { clientX: number; clientY: number }) => {
     if (!canvasRef.current) return { x: 0, y: 0 };
     const rect = canvasRef.current.getBoundingClientRect();
-    const cx = "touches" in e ? e.touches[0].clientX : (e as React.MouseEvent).clientX;
-    const cy = "touches" in e ? e.touches[0].clientY : (e as React.MouseEvent).clientY;
-    return { x: Math.max(0, Math.min(1, (cx - rect.left) / rect.width)), y: Math.max(0, Math.min(1, (cy - rect.top) / rect.height)) };
+    return { x: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)), y: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)) };
   };
 
   /** Masks visible right now: the image's masks, or this video frame's faces plus drawn areas. */
@@ -436,7 +484,7 @@ export default function ObscuraX() {
     return best;
   };
 
-  const onPtrDown = (e: React.MouseEvent | React.TouchEvent) => {
+  const onPtrDown = (e: { clientX: number; clientY: number }) => {
     dragging.current = true;
     const pos = posFromEvent(e);
     if (tool === "mask") {
@@ -450,9 +498,8 @@ export default function ObscuraX() {
     } else if (tool === "watermark") { setActivePreset(null); setWmPos(pos); }
   };
 
-  const onPtrMove = (e: React.MouseEvent | React.TouchEvent) => {
+  const onPtrMove = (e: { clientX: number; clientY: number }) => {
     if (!dragging.current) return;
-    e.preventDefault();
     const pos = posFromEvent(e);
     const start = maskStart.current, id = drawingId.current;
     if (tool === "mask" && start && id) {
@@ -472,6 +519,72 @@ export default function ObscuraX() {
       const w = Math.abs(m.w), h = Math.abs(m.h);
       return w < 0.005 && h < 0.005 ? [] : [{ ...m, x, y, w, h }];
     }));
+  };
+
+  // ── Pointer input: mouse, pen and touch ──
+  // One pointer draws a mask or moves the watermark (Adjust: pans the view).
+  // A second finger cancels that and pinches to zoom / drags to pan instead.
+  const pointers = useRef(new Map<number, { x: number; y: number }>());
+  const gesture = useRef<{ d0: number; z0: number; mx: number; my: number; sl: number; st: number } | null>(null);
+  const pan = useRef<{ x: number; y: number; sl: number; st: number } | null>(null);
+
+  const cancelStroke = () => {
+    const id = drawingId.current;
+    dragging.current = false; maskStart.current = null; drawingId.current = null;
+    if (id) updateMasks(prev => prev.filter(m => m.id !== id));
+  };
+
+  const startGesture = () => {
+    const [a, b] = [...pointers.current.values()], st = stageRef.current;
+    gesture.current = {
+      d0: Math.hypot(a.x - b.x, a.y - b.y) || 1, z0: zoom ?? shownScale,
+      mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2, sl: st?.scrollLeft ?? 0, st: st?.scrollTop ?? 0,
+    };
+  };
+
+  const onCanvasPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    // Keep receiving moves when the finger or mouse leaves the canvas mid-drag.
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.current.size === 2) { cancelStroke(); pan.current = null; startGesture(); return; }
+    if (pointers.current.size > 2) return;
+    if (tool === "adjust") {
+      const st = stageRef.current;
+      if (st) pan.current = { x: e.clientX, y: e.clientY, sl: st.scrollLeft, st: st.scrollTop };
+      return;
+    }
+    onPtrDown(e);
+  };
+
+  const onCanvasPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!pointers.current.has(e.pointerId)) return;
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const st = stageRef.current, g = gesture.current;
+    if (g && pointers.current.size >= 2) {
+      const [a, b] = [...pointers.current.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      setZoom(Math.min(8, Math.max(0.05, g.z0 * (d / g.d0))));
+      if (st) { st.scrollLeft = g.sl - ((a.x + b.x) / 2 - g.mx); st.scrollTop = g.st - ((a.y + b.y) / 2 - g.my); }
+      return;
+    }
+    if (pan.current && st) {
+      st.scrollLeft = pan.current.sl - (e.clientX - pan.current.x);
+      st.scrollTop = pan.current.st - (e.clientY - pan.current.y);
+      return;
+    }
+    onPtrMove(e);
+  };
+
+  const onCanvasPointerEnd = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!pointers.current.delete(e.pointerId)) return;
+    if (gesture.current) {
+      // Lifting fingers after a pinch never starts a stroke with the one left down.
+      if (pointers.current.size === 0) gesture.current = null;
+      return;
+    }
+    pan.current = null;
+    onPtrUp();
   };
 
   const exportConfigJson = () => {
@@ -547,10 +660,8 @@ export default function ObscuraX() {
       const blob = await canvasBlob(out, isPng ? "image/png" : "image/jpeg");
       out.width = 0;
       if (!blob) throw new Error("Canvas could not be encoded");
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `${exportPrefix}${baseName(entry.file.name)}.${isPng ? "png" : "jpg"}`;
-      a.click(); showToast("Image downloaded");
+      const file = downloadBlob(blob, `${exportPrefix}${baseName(entry.file.name)}.${isPng ? "png" : "jpg"}`);
+      showToast("Image downloaded", file);
       return true;
     } catch (err) {
       console.error("ObscuraX: Export failed:", err);
@@ -598,8 +709,8 @@ export default function ObscuraX() {
     }
     setBulkProgress({ done: images.length, total: images.length }); setExportMsg("Compressing…");
     const zipBlob = await zip.generateAsync({ type: "blob" }, (meta: { percent: number }) => setExpPct(Math.round(meta.percent)));
-    const a = document.createElement("a"); a.href = URL.createObjectURL(zipBlob); a.download = `${exportPrefix}images.zip`; a.click();
-    setBulkProgress(null); setExportMsg(""); setExpPct(0); showToast("ZIP downloaded");
+    const file = downloadBlob(zipBlob, `${exportPrefix}images.zip`);
+    setBulkProgress(null); setExportMsg(""); setExpPct(0); showToast("ZIP downloaded", file);
     return true;
   };
 
@@ -611,21 +722,23 @@ export default function ObscuraX() {
       // Never export with a missing or out-of-date face track.
       if (trackStatus !== "ready" && !(await scanVideo())) return;
     }
-    const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9" : "video/webm";
-    const stream = (cvs as any).captureStream(60);
-    const recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 5000000 });
+    const type = recordType();
+    if (!type || typeof cvs.captureStream !== "function") {
+      setFileError("This browser can't record video. Try Chrome, Edge, Firefox or Safari 14.1 or later.");
+      return;
+    }
+    const stream = cvs.captureStream(60);
+    const recorder = new MediaRecorder(stream, { mimeType: type.mime, videoBitsPerSecond: 5000000 });
     const chunks: Blob[] = [];
     recorder.ondataavailable = (e: BlobEvent) => { if (e.data.size > 0) chunks.push(e.data); };
     recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: "video/webm" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a"); a.href = url; a.download = `${exportPrefix}video_${Date.now()}.webm`;
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      setExporting(false); setExpPct(0); showToast("Video downloaded");
+      const blob = new Blob(chunks, { type: type.mime.split(";")[0] });
+      const file = downloadBlob(blob, `${exportPrefix}video_${Date.now()}.${type.ext}`);
+      setExporting(false); setExpPct(0); showToast("Video downloaded", file);
       if (vidElRef.current) vidElRef.current.playbackRate = 1.0;
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
     };
-    vid.currentTime = 0; vid.playbackRate = 4.0;
+    // Phones can't render masks fast enough at 4× speed; they record in real time.
+    vid.currentTime = 0; vid.playbackRate = isTouch ? 1.0 : 4.0;
     setExporting(true); setVideoPaused(false); recorder.start(); vid.play();
     const onProg = () => setExpPct(vid.duration ? Math.round((vid.currentTime / vid.duration) * 100) : 0);
     vid.addEventListener("timeupdate", onProg);
@@ -636,6 +749,20 @@ export default function ObscuraX() {
 
   // ── View ────────────────────────────────────────────────────────────────────
   const { mode: themeMode, cycle: cycleTheme } = useTheme();
+  const online = useOnline();
+  const pwa = usePwa();
+  useEffect(() => {
+    if (!pwa.offlineReady) return;
+    showToast("Ready to work offline");
+    clearOfflineReady();
+  }, [pwa.offlineReady, showToast]);
+
+  // Phone layout: tapping the active tool again hides its panel to give the image more room.
+  const [panelOpen, setPanelOpen] = useState(true);
+  const pickTool = (id: Tool) => {
+    if (id === tool && isPhoneLayout()) setPanelOpen(o => !o);
+    else { setTool(id); setPanelOpen(true); }
+  };
   const [exportOpen, setExportOpen] = useState(false);
   const [exportScope, setExportScope] = useState<"all" | "current">("all");
 
@@ -657,7 +784,7 @@ export default function ObscuraX() {
     const c = canvasRef.current, st = stageRef.current;
     if (!c || !st) return;
     const measure = () => {
-      if (c.width) setShownScale(c.clientWidth / c.width);
+      if (naturalW.current) setShownScale(c.clientWidth / naturalW.current);
       setCanvasBox({ left: c.offsetLeft, top: c.offsetTop, width: c.offsetWidth, height: c.offsetHeight });
     };
     const ro = new ResizeObserver(measure);
@@ -780,7 +907,7 @@ export default function ObscuraX() {
 
   // Export size: what the upscale setting produces for the images being exported.
   const exportImgs = mode !== "image" ? [] : exportAll ? images : activeImg ? [activeImg] : [];
-  const cappedCount = upscaleFactor > 1 ? exportImgs.filter(img => fitScale(img.w, img.h, upscaleFactor) < upscaleFactor).length : 0;
+  const cappedCount = exportImgs.filter(img => fitScale(img.w, img.h, upscaleFactor) < upscaleFactor).length;
   const outSize = activeImg && !exportAll ? upscaledSize(activeImg.w || canvasDims.w, activeImg.h || canvasDims.h, upscaleFactor) : null;
   const fmtScale = (s: number) => `${Number(s.toFixed(1))}×`;
 
@@ -832,13 +959,13 @@ export default function ObscuraX() {
         <div className="rail-logo" aria-hidden="true">OX</div>
         <div className="rail-sep" />
         {TOOLS.map(({ id, label, key, Icon }) => (
-          <button key={id} type="button" className="rail-btn" aria-pressed={tool === id} aria-label={label} title={`${label} (${key})`} onClick={() => setTool(id)}>
-            <Icon aria-hidden="true" />
+          <button key={id} type="button" className="rail-btn" aria-pressed={tool === id} aria-label={label} title={`${label} (${key})`} onClick={() => pickTool(id)}>
+            <Icon aria-hidden="true" /><span className="rail-label" aria-hidden="true">{label}</span>
           </button>
         ))}
         <div className="rail-end">
           <button type="button" className="rail-btn" onClick={cycleTheme} aria-label={`Colour mode: ${themeLabel}. Click to change.`} title={`${themeLabel} (click to change)`}>
-            <ThemeIcon aria-hidden="true" />
+            <ThemeIcon aria-hidden="true" /><span className="rail-label" aria-hidden="true">Theme</span>
           </button>
         </div>
       </nav>
@@ -853,18 +980,23 @@ export default function ObscuraX() {
           </div>
         )}
         <div className="spacer" />
-        {activity && <span className="activity" role="status"><Spinner />{activity}</span>}
+        {!online && (
+          <span className="activity offline" role="status" title="No connection. Everything still works: files are processed on this device.">
+            <WifiOff aria-hidden="true" /><span className="hide-sm">Offline</span>
+          </span>
+        )}
+        {activity && <span className="activity" role="status" title={activity}><Spinner /><span className="hide-sm">{activity}</span></span>}
         {mode && (
           <div className="zoom" role="group" aria-label="Zoom">
-            <button type="button" onClick={() => zoomBy(0.8)} aria-label="Zoom out" title="Zoom out (Ctrl/⌘ + −)"><Minus aria-hidden="true" /></button>
+            <button type="button" className="hide-sm" onClick={() => zoomBy(0.8)} aria-label="Zoom out" title="Zoom out (Ctrl/⌘ + −)"><Minus aria-hidden="true" /></button>
             <button type="button" className="pct" onClick={() => setZoom(1)} aria-label="Actual size" title="Actual size">{Math.round((zoom ?? shownScale) * 100)}%</button>
-            <button type="button" onClick={() => zoomBy(1.25)} aria-label="Zoom in" title="Zoom in (Ctrl/⌘ + =)"><Plus aria-hidden="true" /></button>
+            <button type="button" className="hide-sm" onClick={() => zoomBy(1.25)} aria-label="Zoom in" title="Zoom in (Ctrl/⌘ + =)"><Plus aria-hidden="true" /></button>
             <button type="button" onClick={() => setZoom(null)} aria-pressed={zoom === null} aria-label="Fit to window" title="Fit to window (Ctrl/⌘ + 0)"><Maximize aria-hidden="true" /></button>
           </div>
         )}
         <button type="button" className="btn" onClick={pickFiles}><ImagePlus aria-hidden="true" /><span className="hide-sm">Open</span></button>
-        <button type="button" className="btn primary" onClick={openExport} disabled={!mode || busy}>
-          {busy ? <Spinner /> : <Download aria-hidden="true" />}Export
+        <button type="button" className="btn primary" onClick={openExport} disabled={!mode || busy} aria-label="Export">
+          {busy ? <Spinner /> : <Download aria-hidden="true" />}<span className="hide-xs">Export</span>
         </button>
       </header>
 
@@ -875,15 +1007,16 @@ export default function ObscuraX() {
             <button type="button" className="drop lg" onClick={pickFiles}>
               <Upload aria-hidden="true" />
               <span className="t">Open images or a video</span>
-              <span className="sub">Drop files here, or click to choose. Up to {MAX_FILES} images, or one video. Files stay on this device.</span>
+              <span className="sub">
+                {isTouch ? "Tap to choose photos or a video" : "Drop files here, or click to choose"}. Up to {MAX_FILES} images, or one video. Files stay on this device, and it works offline.
+              </span>
             </button>
           ) : (
             <canvas ref={canvasRef} aria-label={`Preview of ${mediaName}`} data-tool={tool}
               style={zoom === null ? undefined : { width: canvasDims.w * zoom }}
-              onMouseDown={onPtrDown} onMouseMove={onPtrMove} onMouseUp={onPtrUp} onMouseLeave={onPtrUp}
-              onTouchStart={e => { e.preventDefault(); onPtrDown(e); }}
-              onTouchMove={e => { e.preventDefault(); onPtrMove(e); }}
-              onTouchEnd={onPtrUp}
+              onPointerDown={onCanvasPointerDown} onPointerMove={onCanvasPointerMove}
+              onPointerUp={onCanvasPointerEnd} onPointerCancel={onCanvasPointerEnd}
+              onContextMenu={e => e.preventDefault()}
             />
           )}
           {/* Outlines of blurred areas; editor-only, never drawn into the export. */}
@@ -967,14 +1100,17 @@ export default function ObscuraX() {
       </footer>
 
       {/* ── Properties for the active tool ── */}
-      <aside className="insp" aria-labelledby="insp-title">
+      <aside className={`insp${panelOpen ? "" : " closed"}`} aria-labelledby="insp-title">
+        <button type="button" className="insp-hide icon-x" onClick={() => setPanelOpen(false)} aria-label="Hide panel" title="Hide panel">
+          <ChevronDown aria-hidden="true" />
+        </button>
         {tool === "mask" && (
           <>
             <h2 id="insp-title">Face blur</h2>
             <p className="insp-sub">Faces are found and covered on this device. Nothing is uploaded.</p>
             <SwitchRow label="Find faces automatically" value={faceBlurOn} onChange={setFaceBlur} />
             {faceBlurOn && modelError && (
-              <div className="notice err" role="alert">The face model couldn't be downloaded. Check the internet connection, then reload the page.</div>
+              <div className="notice err" role="alert">The face model couldn't be loaded. Reload the page to try again.</div>
             )}
 
             {mode && (
@@ -1167,7 +1303,7 @@ export default function ObscuraX() {
         )}
         <div className="grid">
           <div className="stat"><div className="k">{exportAll ? "Images" : "File"}</div><div className="v" title={mediaName}>{exportAll ? images.length : mediaName}</div></div>
-          <div className="stat"><div className="k">Saves as</div><div className="v">{mode === "video" ? "WebM video" : exportAll ? "ZIP of images" : activeImg?.file.type === "image/png" ? "PNG" : "JPG"}</div></div>
+          <div className="stat"><div className="k">Saves as</div><div className="v">{mode === "video" ? (recordType()?.ext === "mp4" ? "MP4 video" : "WebM video") : exportAll ? "ZIP of images" : activeImg?.file.type === "image/png" ? "PNG" : "JPG"}</div></div>
         </div>
         {mode === "image" && (
           <>
@@ -1177,14 +1313,16 @@ export default function ObscuraX() {
             </Field>
             {outSize && outSize.w > 0 && (
               <p className="hint num">
-                {outSize.scale > 1 ? <>{activeImg!.w} × {activeImg!.h} → <strong>{outSize.w} × {outSize.h} px</strong></> : <>{outSize.w} × {outSize.h} px</>}
-                {cappedCount > 0 && <> · enlarged {fmtScale(outSize.scale)}, the most the browser can save</>}
+                {outSize.scale !== 1 ? <>{activeImg!.w} × {activeImg!.h} → <strong>{outSize.w} × {outSize.h} px</strong></> : <>{outSize.w} × {outSize.h} px</>}
+                {cappedCount > 0 && (outSize.scale > 1
+                  ? <> · enlarged {fmtScale(outSize.scale)}, the most this device can save</>
+                  : <> · saved smaller: this device can save up to {Math.floor(UPSCALE_MAX_PIXELS / 1e6)} MP</>)}
               </p>
             )}
-            {exportAll && upscaleFactor > 1 && (
+            {exportAll && (upscaleFactor > 1 || cappedCount > 0) && (
               <p className="hint">
-                Each image is enlarged {upscaleFactor}×.
-                {cappedCount > 0 && ` ${plural(cappedCount, "large image")} ${cappedCount === 1 ? "is" : "are"} enlarged less, to stay under ${UPSCALE_MAX_PIXELS / 1e6} MP.`}
+                {upscaleFactor > 1 && `Each image is enlarged ${upscaleFactor}×.`}
+                {cappedCount > 0 && ` ${plural(cappedCount, "large image")} ${cappedCount === 1 ? "is" : "are"} ${upscaleFactor > 1 ? "enlarged less" : "saved smaller"}, to stay under the ${Math.floor(UPSCALE_MAX_PIXELS / 1e6)} MP this device can save.`}
               </p>
             )}
             {upscaleFactor > 1 && (
@@ -1235,7 +1373,18 @@ export default function ObscuraX() {
         />
       )}
 
-      {toastMsg && <div className="toast" role="status">{toastMsg}</div>}
+      {pwa.updateReady ? (
+        <div className="toast has-action" role="status">
+          <span>A new version is ready. Reloading clears the current edit.</span>
+          <button type="button" className="btn sm" onClick={applyUpdate}><RefreshCw aria-hidden="true" />Reload</button>
+          <button type="button" className="icon-x" onClick={dismissUpdate} aria-label="Later" title="Later"><X aria-hidden="true" /></button>
+        </div>
+      ) : toastMsg && (
+        <div className={`toast${shareFile ? " has-action" : ""}`} role="status">
+          <span>{toastMsg}</span>
+          {shareFile && <button type="button" className="btn sm" onClick={shareExport}><Share2 aria-hidden="true" />Share or save</button>}
+        </div>
+      )}
     </div>
   );
 }

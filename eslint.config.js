@@ -26,4 +26,13 @@ export default defineConfig([
       'no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]' }],
     },
   },
+  {
+    // Service worker source; vite.config.js substitutes __ASSETS__ at build time.
+    files: ['src/sw-template.js'],
+    languageOptions: { globals: { ...globals.serviceworker, __ASSETS__: 'readonly' } },
+  },
+  {
+    files: ['vite.config.js'],
+    languageOptions: { globals: globals.node },
+  },
 ])

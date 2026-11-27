@@ -1,18 +1,24 @@
 // Image upscaling on the canvas: high-quality resampling plus an unsharp mask
 // to restore edge crispness. Runs locally; nothing is uploaded.
 
-/** Browsers refuse canvases past ~16k per side, and very large ones exhaust memory. */
-export const UPSCALE_MAX_SIDE = 16384;
-export const UPSCALE_MAX_PIXELS = 50_000_000;
+import { CANVAS_MAX_PIXELS, CANVAS_MAX_SIDE } from "./device";
+
+/** Browsers refuse canvases past ~16k per side, and very large ones exhaust memory (far sooner on phones). */
+export const UPSCALE_MAX_SIDE = CANVAS_MAX_SIDE;
+export const UPSCALE_MAX_PIXELS = CANVAS_MAX_PIXELS;
 
 export const UPSCALE_FACTORS = [1, 2, 3, 4] as const;
 
-/** Largest factor up to `factor` whose output still fits the canvas limits. */
+/**
+ * Largest factor up to `factor` whose output still fits the canvas limits.
+ * Below 1 when even the original is too big for this device (e.g. a 24 MP
+ * iPhone photo on iOS Safari), so the export is saved smaller instead of failing.
+ */
 export function fitScale(w: number, h: number, factor: number): number {
-  if (factor <= 1 || !w || !h) return 1;
+  if (!w || !h) return 1;
   const bySide = UPSCALE_MAX_SIDE / Math.max(w, h);
   const byArea = Math.sqrt(UPSCALE_MAX_PIXELS / (w * h));
-  return Math.max(1, Math.min(factor, bySide, byArea));
+  return Math.min(Math.max(1, factor), bySide, byArea);
 }
 
 /** Output size for an image enlarged by `factor`, capped to the canvas limits. */

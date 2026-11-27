@@ -3,12 +3,25 @@
 
 <head>
   <meta charset="UTF-8" />
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>ObscuraX</title>
   <meta name="description"
-    content="Blur faces in images and videos instantly. ObscuraX is a powerful online privacy tool for masking and anonymizing media with real-time preview.">
+    content="Blur faces in images and videos instantly. ObscuraX is a privacy tool for masking and anonymizing media with real-time preview. Works offline; files never leave your device.">
   <meta name="keywords" content="face blur tool, video blur, image masking, privacy tool, anonymize video">
+
+  <!-- Installable app: works offline once opened (see src/pwa.ts) -->
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" type="image/svg+xml" href="./icons/icon.svg" />
+  <link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+  <meta name="theme-color" content="#E6E6E4" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#151617" media="(prefers-color-scheme: dark)" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="ObscuraX" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="format-detection" content="telephone=no" />
+
   <script>
     // Apply the saved colour mode before first paint (see src/hooks/useTheme.ts).
     try {

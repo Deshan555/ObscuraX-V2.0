@@ -106,14 +106,20 @@
 /* ---------- base ---------- */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html, body, #root { height: 100%; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body {
   font: 14px/1.5 var(--font);
   color: var(--text);
   background: var(--bg);
   -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  /* No pull-to-refresh or bounce: a stray swipe must not reload away the edit. */
+  overscroll-behavior: none;
   transition: background .25s;
 }
 button, input, select, textarea { font: inherit; color: inherit; }
+/* No double-tap zoom delay on controls. */
+button, input, select, label, a { touch-action: manipulation; }
 h1 { font-size: 32px; font-weight: 300; line-height: 1.05; letter-spacing: -0.03em; }
 h2 { font-size: 20px; font-weight: 300; letter-spacing: -0.02em; margin-bottom: 14px; }
 b, strong { font-weight: 500; }
@@ -350,7 +356,7 @@ input.swatch::-moz-color-swatch { border: 0; border-radius: 50%; }
   left: 50%;
   bottom: 24px;
   z-index: 60;
-  max-width: 460px;
+  max-width: min(460px, calc(100vw - 24px));
   padding: 12px 22px;
   border-radius: 999px;
   background: var(--ink);
@@ -369,7 +375,9 @@ body { overflow: hidden; }
   grid-template-areas: "rail top top" "rail stage insp" "rail dock insp";
   gap: 8px 12px;
   height: 100vh;
+  height: 100dvh;
   padding: 8px 12px 12px 0;
+  padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) 0;
 }
 
 /* Tool rail: dark in both modes, pinned to the left edge like the guide's sidebar. */
@@ -417,6 +425,7 @@ body { overflow: hidden; }
 .rail-btn[aria-pressed="true"] { background: var(--nav-active-bg); color: var(--nav-active); }
 .rail-btn:focus-visible { outline-color: #FFFFFF; }
 .rail-end { margin-top: auto; }
+.rail-label { display: none; }
 
 /* Top bar */
 .topbar { grid-area: top; display: flex; align-items: center; gap: 10px; min-width: 0; padding-left: 4px; }
@@ -458,10 +467,12 @@ body { overflow: hidden; }
   transition: box-shadow .15s;
 }
 .stage.over { box-shadow: inset 0 0 0 2px var(--ink); }
-.stage canvas { display: block; margin: auto; flex-shrink: 0; border-radius: 14px; touch-action: none; }
+.stage canvas { display: block; margin: auto; flex-shrink: 0; border-radius: 14px; touch-action: none; -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
 .stage.fit canvas { max-width: 100%; max-height: 100%; }
 .stage canvas[data-tool="mask"] { cursor: crosshair; }
 .stage canvas[data-tool="watermark"] { cursor: move; }
+.stage:not(.fit) canvas[data-tool="adjust"] { cursor: grab; }
+.stage:not(.fit) canvas[data-tool="adjust"]:active { cursor: grabbing; }
 .stage-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--muted); }
 .tool-hint {
   position: absolute;
@@ -577,7 +588,8 @@ body { overflow: hidden; }
 .status.good svg { color: var(--good); }
 
 /* Properties panel */
-.insp { grid-area: insp; min-height: 0; overflow-y: auto; padding: 22px 22px 24px; border-radius: 28px; background: var(--surface); }
+.insp { grid-area: insp; position: relative; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 22px 22px 24px; border-radius: 28px; background: var(--surface); }
+.insp-hide { display: none; }
 .insp h2 { margin-bottom: 2px; }
 .insp-sub { font-size: 13px; color: var(--muted); margin-bottom: 16px; }
 .insp-sec { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
@@ -610,7 +622,12 @@ body { overflow: hidden; }
 .modal-foot > div { display: flex; gap: 8px; flex-wrap: wrap; }
 .modal-foot > div:last-child { margin-left: auto; }
 .modal-card .grid { grid-template-columns: 1fr 1fr; }
-.toast { bottom: 108px; }
+.toast { bottom: calc(108px + env(safe-area-inset-bottom)); }
+.toast.has-action { display: flex; align-items: center; gap: 12px; padding: 8px 8px 8px 22px; border-radius: 28px; }
+.toast.has-action > span { flex: 1; min-width: 0; }
+.toast .btn { flex-shrink: 0; }
+.toast .icon-x:hover { background: rgba(127, 127, 127, .25); }
+.activity.offline svg { width: 15px; height: 15px; }
 
 /* Blurred-area outlines over the image (editor only) */
 .stage { position: relative; }
@@ -680,24 +697,130 @@ body { overflow: hidden; }
 .switch.sm::after { width: 18px; height: 18px; }
 .switch.sm[aria-checked="true"]::after { left: 19px; }
 
-/* ---------- narrow windows ---------- */
+/* ---------- narrow windows (tablets, phones in landscape) ---------- */
 @media (max-width: 980px) {
   body { overflow: auto; }
   .editor {
     grid-template-columns: 64px minmax(0, 1fr);
-    grid-template-rows: 56px minmax(360px, 62vh) auto auto;
+    grid-template-rows: 56px minmax(min(360px, 70dvh), 62dvh) auto auto;
     grid-template-areas: "rail top" "rail stage" "rail dock" "rail insp";
     height: auto;
-    min-height: 100vh;
+    min-height: 100dvh;
   }
-  .rail { position: sticky; top: 0; height: 100vh; }
+  .rail { position: sticky; top: 0; height: 100vh; height: 100dvh; }
   .insp { overflow: visible; }
 }
 @media (max-width: 640px) {
-  .hide-sm { display: none; }
+  .hide-sm, .zoom .hide-sm { display: none; }
   .topbar .brand { display: none; }
   .doc { border-left: 0; padding-left: 0; }
   .dock { flex-wrap: wrap; }
+}
+
+/* ---------- phones ----------
+   One screen, no page scroll: top bar, image, dock, settings panel, and a
+   bottom tab bar for the tools. The panel scrolls on its own and can be
+   hidden (tap the active tab, or the chevron) to give the image more room. */
+@media (max-width: 760px) {
+  body { overflow: hidden; }
+  .editor {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) auto auto auto;
+    grid-template-areas: "top" "stage" "dock" "insp" "rail";
+    gap: 6px;
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    padding: max(6px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) 0 max(8px, env(safe-area-inset-left));
+  }
+
+  .rail {
+    position: static;
+    height: auto;
+    flex-direction: row;
+    justify-content: space-around;
+    gap: 4px;
+    margin: 0 calc(-1 * max(8px, env(safe-area-inset-right))) 0 calc(-1 * max(8px, env(safe-area-inset-left)));
+    padding: 6px max(10px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
+    border-radius: 20px 20px 0 0;
+    overflow: visible;
+  }
+  .rail-logo, .rail-sep { display: none; }
+  .rail-end { margin: 0; }
+  .rail-btn { flex-direction: column; gap: 2px; width: auto; min-width: 64px; height: 52px; padding: 0 8px; }
+  .rail-label { display: block; font-size: 11px; font-weight: 500; line-height: 1.2; white-space: nowrap; }
+
+  .topbar { gap: 8px; padding-left: 0; min-height: 44px; }
+  .topbar .btn { padding: 9px 14px; }
+  .doc { flex: 1; }
+  .doc + .spacer { display: none; }
+  .zoom .pct { min-width: 52px; }
+
+  .stage { padding: 6px; border-radius: 20px; }
+  .stage canvas { border-radius: 10px; }
+  .drop.lg { min-height: 0; height: 100%; max-height: 420px; padding: 20px 16px; }
+  .tool-hint { bottom: 8px; }
+
+  .dock { min-height: 0; gap: 8px; padding: 8px 10px; border-radius: 16px; }
+  .strip, .transport { flex-basis: 100%; }
+  .strip { padding: 2px; }
+  .strip-pick { width: 60px; height: 44px; border-radius: 10px; }
+  .strip-add { width: 44px; height: 44px; border-radius: 10px; }
+  .status { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+  .insp { max-height: 40dvh; overflow-y: auto; padding: 16px 16px 18px; border-radius: 20px; }
+  .insp.closed { display: none; }
+  .insp-hide { display: flex; position: absolute; top: 10px; right: 10px; }
+  .insp h2 { padding-right: 40px; }
+  .card { border-radius: 22px; padding: 18px; }
+
+  /* Export dialog becomes a bottom sheet. */
+  .modal { align-items: flex-end; padding: 0; }
+  .modal-card {
+    max-width: none;
+    max-height: 92dvh;
+    overflow-y: auto;
+    margin: 0;
+    border-radius: 24px 24px 0 0;
+    padding-bottom: max(18px, env(safe-area-inset-bottom));
+  }
+  .modal-foot > div:last-child { width: 100%; margin-left: 0; }
+  .modal-foot > div:last-child .btn { flex: 1; }
+
+  .toast { bottom: calc(80px + env(safe-area-inset-bottom)); }
+  .stage-notice { top: 8px; }
+}
+@media (max-width: 400px) {
+  .hide-xs { display: none; }
+  .rail-btn { min-width: 56px; }
+}
+
+/* ---------- touch screens ---------- */
+@media (pointer: coarse) {
+  /* 16px stops iOS zooming the page when a field is focused. */
+  .input, .select select { font-size: 16px; }
+  .icon-x { width: 36px; height: 36px; }
+  .icon-x svg { width: 18px; height: 18px; }
+  .btn.sm { min-height: 36px; }
+  .zoom button { height: 42px; min-width: 42px; }
+  .dl-btn { width: 44px; height: 44px; }
+  .seg button { padding: 9px 12px; }
+  .switch.sm { width: 46px; height: 28px; border-radius: 14px; }
+  .switch.sm::after { width: 22px; height: 22px; }
+  .switch.sm[aria-checked="true"]::after { left: 21px; }
+  .mk-row { padding: 6px 8px 6px 6px; }
+  .range input { height: 32px; }
+  .swatch { width: 34px; height: 34px; }
+  /* No hover on touch: show the remove buttons, and use pressed states instead. */
+  .strip-remove { opacity: 1; width: 24px; height: 24px; }
+  .btn:active, .dl-btn:active { filter: brightness(.9); }
+  .rail-btn:active { background: rgba(255, 255, 255, .12); }
+}
+@media (hover: none) {
+  .btn:hover, .dl-btn:hover { filter: none; }
+  .btn.primary:hover { opacity: 1; }
+  .rail-btn:hover { color: var(--nav-icon); background: none; }
+  .rail-btn[aria-pressed="true"]:hover { background: var(--nav-active-bg); color: var(--nav-active); }
 }
 
 /* ---------- reduce motion ---------- */
